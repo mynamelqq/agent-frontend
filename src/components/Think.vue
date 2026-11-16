@@ -9,6 +9,8 @@ const props = withDefaults(
     thinking?: boolean;
     /** 推理耗时（毫秒），用于头部展示，可选 */
     thinkingTime?: number;
+    /** Agent 运行记录中的无边框样式 */
+    minimal?: boolean;
     /** 标题文案，默认 "Thought" */
     label?: string;
   }>(),
@@ -94,6 +96,20 @@ function handleThinkScroll() {
   autoScrollToBottom.value = distanceToBottom <= THRESHOLD;
 }
 
+function toggleCollapsed() {
+  collapsed.value = !collapsed.value;
+  if (!collapsed.value) {
+    autoScrollToBottom.value = true;
+    scrollThinkToBottom(true);
+  }
+}
+
+function handleMinimalKeydown(event: KeyboardEvent) {
+  if (!props.minimal || (event.key !== 'Enter' && event.key !== ' ')) return;
+  event.preventDefault();
+  toggleCollapsed();
+}
+
 // 在推理内容追加时，如果未折叠且仍允许自动滚动，则滚动到底部
 watch(
   () => props.thinkchunk,
@@ -120,12 +136,20 @@ const thinkingSeconds = computed(() => {
 </script>
 
 <template>
-  <div class="think-card">
+  <div class="think-card" :class="{ minimal: props.minimal }">
     <!-- 顶部按钮和状态 -->
-    <div class="think-header">
+    <div
+      class="think-header"
+      :role="props.minimal ? 'button' : undefined"
+      :tabindex="props.minimal ? 0 : undefined"
+      :aria-expanded="props.minimal ? !collapsed : undefined"
+      @click="props.minimal && toggleCollapsed()"
+      @keydown="handleMinimalKeydown"
+    >
       <div class="think-label">
         <div v-if="thinking" class="think-thinking">
-          <span>thinking</span>
+          <span>{{ props.minimal ? '思考中' : 'thinking' }}</span>
+          <span v-if="props.minimal && thinkingSeconds" class="think-time">{{ thinkingSeconds }}</span>
           <div class="think-spinner" style="animation: think-spinner-rotate 1s linear infinite;">
             <svg
               xmlns="http://www.w3.org/2000/svg"
@@ -142,21 +166,16 @@ const thinkingSeconds = computed(() => {
         </div>
         <div v-else>
           {{ props.label }}
-          <span v-if="thinkingSeconds" class="think-time">· {{ thinkingSeconds }}</span>
+          <span v-if="thinkingSeconds" class="think-time">{{ thinkingSeconds }}</span>
         </div>
       </div>
+      <svg v-if="props.minimal" class="think-chevron" :class="{ expanded: !collapsed }" width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+        <path d="m4 6 4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+      </svg>
       <button
+        v-if="!props.minimal"
         class="think-toggle"
-        @click="
-          () => {
-            const next = !collapsed;
-            collapsed = next;
-            if (!next) return;
-            // 展开时重新开启自动滚动并立即滚动到底部
-            autoScrollToBottom = true;
-            scrollThinkToBottom(true);
-          }
-        "
+        @click="toggleCollapsed"
       >
         {{ collapsed ? "展开" : "折叠" }}
       </button>
@@ -188,6 +207,30 @@ const thinkingSeconds = computed(() => {
   padding: 0.5rem 0.75rem;
   box-shadow: none;
 }
+.think-card.minimal {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+:root.dark .think-card.minimal,
+.dark .think-card.minimal {
+  border: 0;
+  background: transparent;
+}
+.think-card.minimal .think-header { min-height: 32px; padding: 3px 6px; border-radius: 6px; cursor: pointer; justify-content: flex-start; gap: 7px; }
+.think-card.minimal .think-header:hover { background: rgba(105, 125, 150, .07); }
+.think-card.minimal .think-header:focus-visible { outline: 2px solid #7e9ac2; outline-offset: 2px; }
+.think-card.minimal .think-header:hover .think-label { color: var(--text-secondary, #374151); }
+.think-card.minimal .think-content-wrap { border-left: 1px solid var(--border-light, #e5e7eb); margin-left: 13px; padding-left: 12px; }
+.think-card.minimal .think-content-wrap.collapsed { padding: 0; }
+.think-card.minimal .think-label { font-size: 13px; }
+.think-card.minimal .think-time { margin-left: 8px; color: #929aa5; font-size: 12px; font-weight: 400; }
+.think-chevron { flex: none; color: #a1a8b1; transition: transform .18s ease; }
+.think-chevron.expanded { transform: rotate(180deg); }
 :root.dark .think-card,
 .dark .think-card {
   background: var(--think-bg-dark, rgba(255, 255, 255, 0.05));

@@ -787,7 +787,7 @@
             <button
               class="send-button"
               @click="isStreaming ? stopStreaming() : (hasChatId ? handleSend() : startNewConversation())"
-              :disabled="(!currentMessage.trim() && !isStreaming) || hasUnconfirmedAttachments"
+              :disabled="!isStreaming && (!currentMessage.trim() || hasUnconfirmedAttachments)"
               :title="isStreaming ? '停止生成' : (hasChatId ? '发送消息 (Enter)' : '开始对话')"
             >
               <span v-if="!isStreaming">🚀</span>
@@ -971,8 +971,20 @@ import { buildWsUrl } from '../api/base-url'
 
 import { uploadFile } from '../api/upload'
 import { compressMediaAttachment, isAllowedVideoFormat } from '../utils/attachment-compress'
-import { streamChat, streamRegenerate, StreamChatError, StreamChatErrorCode, cancelChat, favorChatMessage } from '../api/chat'
+import {
+  streamChat,
+  streamRegenerate,
+  resubscribeStream,
+  getStreamingSnapshot,
+  type StreamingSnapshot,
+  StreamChatError,
+  StreamTerminalError,
+  StreamChatErrorCode,
+  cancelChat,
+  favorChatMessage
+} from '../api/chat'
 import { ensureAnonIdentified } from '../api/anon'
+import { setChatRunning } from '../stores/chat-runs'
 import { getOcr } from '../api/ocr'
 import { readText as ttsReadText, stopTts } from '../api/tts'
 import { transformMarkdownForStream } from '../utils/markdown'
@@ -1270,6 +1282,8 @@ interface AssistantMessage extends BaseMessage {
   role: 'assistant'
   isStreaming: boolean
   isFinished: boolean
+  completed?: boolean
+  lastSeq?: number
   isFavor?: boolean
   favorLoading?: boolean
   /** 本条由 markdown-it 流式/历史渲染（含尾部光标） */
@@ -1333,6 +1347,8 @@ const currentMessage = ref('')
 const messageInput = ref<HTMLTextAreaElement>()
 const messagesContainer = ref<HTMLElement>()
 const isStreaming = ref(false)
+const instanceChatId = String(route.query.id || '')
+watch(isStreaming, (running) => setChatRunning(instanceChatId, running), { immediate: true })
 const messagesLoading = ref(false) // 点击会话项后拉取 /api/list/message 时的加载状态
 // 是否自动滚动到底部：用户手动上滚后会被关闭，下一次交互再打开
 const shouldAutoScroll = ref(true)
@@ -2110,6 +2126,175 @@ function normalizeStreamChunk(parsed: any): { textChunk: string; reasoningChunk:
   }
 }
 
+function isCompletedMessage(raw: any): boolean {
+  if (typeof raw?.completed === 'boolean') return raw.completed
+  if (typeof raw?.isCompleted === 'boolean') return raw.isCompleted
+  return true
+}
+
+function syncAssistantThinkBlocks(message: AssistantMessage) {
+  const reasoning = String(message.reasoningText ?? '')
+  if (!reasoning.trim()) {
+    message.thinkBlocks = []
+    thinkParsers.delete(message)
+    return
+  }
+  const parser = new PreParse()
+  parser.appendChunk('<think>')
+  message.thinkBlocks = parser.appendChunk(reasoning + '</think>')
+  thinkParsers.set(message, parser)
+}
+
+function applySnapshotToAssistantMessage(message: AssistantMessage, snapshot: StreamingSnapshot) {
+  const rawText = snapshot.content ?? snapshot.text ?? ''
+  const normalizedText = normalizeAssistantDisplayText(String(rawText ?? ''))
+  const status = String(snapshot.status ?? '').toLowerCase()
+  const completed = status === 'done' || status === 'cancelled' ||
+    (status !== 'streaming' && typeof snapshot.completed === 'boolean' && snapshot.completed)
+  message.text = normalizedText
+  message.reasoningText = String(snapshot.reasoning ?? '').trim() || undefined
+  message.completed = completed
+  message.lastSeq = Number(snapshot.seq ?? 0) || 0
+  message.isStreaming = !message.completed
+  message.isFinished = !!message.completed
+  message.renderedByStream = true
+  message.attachmentLoading = false
+  if (normalizedText) {
+    const extractedFiles = extractFileUrls(normalizedText)
+    message.generatedFiles = extractedFiles.length > 0 ? extractedFiles : undefined
+  } else {
+    message.generatedFiles = undefined
+  }
+  syncAssistantThinkBlocks(message)
+}
+
+function appendStreamChunkToAssistantMessage(currentMsg: AssistantMessage, content: string) {
+  let parsed: any = null
+  try {
+    parsed = JSON.parse(content)
+  } catch {
+    parsed = null
+  }
+
+  const hasStructuredChunk =
+    parsed &&
+    typeof parsed === 'object' &&
+    (('text' in parsed || 'reasoning' in parsed) || ('type' in parsed && 'content' in parsed))
+
+  if (hasStructuredChunk) {
+    let { textChunk, reasoningChunk } = normalizeStreamChunk(parsed)
+
+    const textStripped = stripAttachmentLoadingToken(String(textChunk))
+    const reasoningStripped = stripAttachmentLoadingToken(String(reasoningChunk))
+    if (textStripped.hadToken || reasoningStripped.hadToken) currentMsg.attachmentLoading = true
+    textChunk = textStripped.cleaned
+    reasoningChunk = reasoningStripped.cleaned
+
+    if (reasoningChunk) {
+      let parser = thinkParsers.get(currentMsg)
+      if (!parser) {
+        parser = new PreParse()
+        thinkParsers.set(currentMsg, parser)
+        currentMsg.reasoningText = ''
+        currentMsg.thinkBlocks = []
+        parser.appendChunk('<think>')
+      }
+      const blocks = parser.appendChunk(String(reasoningChunk))
+      currentMsg.reasoningText = (currentMsg.reasoningText || '') + String(reasoningChunk)
+      currentMsg.thinkBlocks = blocks
+
+      if (!currentMsg.thinkingStartedAt) {
+        const now = (typeof performance !== 'undefined' && performance.now)
+          ? performance.now()
+          : Date.now()
+        currentMsg.thinkingStartedAt = now
+        currentMsg.isThinkingPhase = true
+      }
+    }
+
+    if (textChunk) {
+      currentMsg.attachmentLoading = false
+      const textStr = String(textChunk)
+      currentMsg.text += textStr
+      if (textStr.includes('![') || containsImageGenFailure(textStr)) {
+        currentMsg.isImageLoading = false
+      }
+      const extractedFiles = extractFileUrls(currentMsg.text)
+      if (extractedFiles.length > 0) {
+        currentMsg.generatedFiles = extractedFiles
+      }
+
+      if (currentMsg.isThinkingPhase && currentMsg.thinkingStartedAt && (!currentMsg.thinkingTime || currentMsg.thinkingTime <= 0)) {
+        const end = (typeof performance !== 'undefined' && performance.now)
+          ? performance.now()
+          : Date.now()
+        const ms = Math.max(0, Math.round(end - currentMsg.thinkingStartedAt))
+        if (ms > 0) {
+          currentMsg.thinkingTime = ms
+        }
+      }
+      currentMsg.isThinkingPhase = false
+    }
+    if (reasoningChunk) {
+      currentMsg.attachmentLoading = false
+    }
+  } else {
+    const rawStr = String(content)
+    const { cleaned: rawCleaned, hadToken: rawHadToken } = stripAttachmentLoadingToken(rawStr)
+    if (rawHadToken) currentMsg.attachmentLoading = true
+    if (rawCleaned) {
+      currentMsg.attachmentLoading = false
+      if (rawCleaned.startsWith(currentMsg.text)) {
+        currentMsg.text += rawCleaned.slice(currentMsg.text.length)
+      } else {
+        currentMsg.text += rawCleaned
+      }
+    }
+    if (rawStr.includes('![') || containsImageGenFailure(rawStr)) {
+      currentMsg.isImageLoading = false
+    }
+    const extractedFiles = extractFileUrls(currentMsg.text)
+    if (extractedFiles.length > 0) {
+      currentMsg.generatedFiles = extractedFiles
+    }
+  }
+}
+
+function finalizeAssistantStreamMessage(currentMsg: AssistantMessage, startedAt?: number) {
+  currentMsg.attachmentLoading = false
+  currentMsg.isImageLoading = false
+  if (currentMsg.text) {
+    const extractedFiles = extractFileUrls(currentMsg.text)
+    if (extractedFiles.length > 0) {
+      currentMsg.generatedFiles = extractedFiles
+    }
+  }
+  if (currentMsg.reasoningText && currentMsg.thinkBlocks) {
+    const parser = thinkParsers.get(currentMsg)
+    if (parser) {
+      const hasUnfinishedBlock = currentMsg.thinkBlocks.some(
+        (b) => b.symbol.toLowerCase() === '<think>' && !b.finished
+      )
+      if (hasUnfinishedBlock) {
+        currentMsg.thinkBlocks = parser.appendChunk('</think>')
+      }
+    }
+  }
+  if ((!currentMsg.cost || currentMsg.cost <= 0) && typeof startedAt === 'number') {
+    const end = (typeof performance !== 'undefined' && performance.now)
+      ? performance.now()
+      : Date.now()
+    const ms = Math.max(0, Math.round(end - startedAt))
+    if (ms > 0) currentMsg.cost = ms
+  }
+  currentMsg.isThinkingPhase = false
+  currentMsg.thinkingStartedAt = undefined
+  currentMsg.isStreaming = false
+  currentMsg.isFinished = true
+  currentMsg.completed = true
+  currentMsg.renderedByStream = true
+}
+
 // 分页相关状态（仅登录用户，从后端加载）
 const currentPage = ref(1)          // 当前已加载的最大页码
 const hasMore = ref(true)           // 是否还有更早的消息
@@ -2120,10 +2305,124 @@ let streamAbortController: AbortController | null = null
 type ActiveStreamState = {
   assistantIndex: number
   destroyed: boolean
+  chatId: string
   /** 本次助手回复计时起点（毫秒，performance.now 优先） */
   startedAt: number
 }
 let activeStreamState: ActiveStreamState | null = null
+let streamRecoveryTimer: ReturnType<typeof setTimeout> | null = null
+let streamRecoveryAttempt = 0
+let restoringStream = false
+
+function clearStreamRecovery() {
+  if (streamRecoveryTimer) clearTimeout(streamRecoveryTimer)
+  streamRecoveryTimer = null
+  streamRecoveryAttempt = 0
+}
+
+function scheduleStreamRecovery() {
+  if (!activeStreamState || activeStreamState.destroyed || streamRecoveryTimer || restoringStream) return
+  if (typeof navigator !== 'undefined' && !navigator.onLine) return
+  const delay = Math.min(8000, 500 * 2 ** Math.min(streamRecoveryAttempt++, 4))
+  streamRecoveryTimer = setTimeout(() => {
+    streamRecoveryTimer = null
+    void restoreLatestUnfinishedAssistantMessage()
+  }, delay)
+}
+
+function handleBrowserOnline() {
+  if (String(route.query.id || '') !== instanceChatId && !activeStreamState) return
+  if (!activeStreamState || activeStreamState.destroyed) {
+    if (findLatestUnfinishedAssistantMessage()) void restoreLatestUnfinishedAssistantMessage()
+    else if (route.query.id && messages.some((item) => item.text === '🔗 加载对话时网络异常')) loadSession()
+    return
+  }
+  if (streamAbortController) return
+  if (streamRecoveryTimer) clearTimeout(streamRecoveryTimer)
+  streamRecoveryTimer = null
+  void restoreLatestUnfinishedAssistantMessage()
+}
+
+function handleBrowserOffline() {
+  const state = activeStreamState
+  if (!state || state.destroyed) return
+  streamAbortController?.abort()
+  markStreamInterrupted(state)
+}
+
+function markStreamInterrupted(state: ActiveStreamState) {
+  if (activeStreamState !== state || state.destroyed) return
+  streamAbortController = null
+  const message = messages[state.assistantIndex]
+  if (message && isAssistantMessage(message)) {
+    message.isStreaming = false
+    message.isFinished = false
+    message.completed = false
+    message.renderedByStream = true
+  }
+  // 后端仍可能在生成；保持会话占用，防止同一 chatId 又启动一个生成任务。
+  isStreaming.value = true
+  scheduleStreamRecovery()
+}
+
+function handleStreamChunk(state: ActiveStreamState, content: string) {
+  if (activeStreamState !== state || state.destroyed) return
+  const message = messages[state.assistantIndex]
+  if (!message || !isAssistantMessage(message)) return
+  let event: { eventType?: string; messageId?: string | number; seq?: number } | null = null
+  try { event = JSON.parse(content) } catch { /* 兼容旧格式 */ }
+  if (event?.messageId != null) message.messageId = String(event.messageId)
+  if (event?.eventType === 'start') return
+  const seq = Number(event?.seq)
+  if (Number.isFinite(seq) && seq > 0) {
+    if (seq <= (message.lastSeq ?? 0)) return
+    message.lastSeq = seq
+  }
+  appendStreamChunkToAssistantMessage(message, content)
+  message.isStreaming = true
+  scheduleAutoScroll()
+}
+
+function finishStream(state: ActiveStreamState) {
+  if (activeStreamState !== state || state.destroyed) return
+  const message = messages[state.assistantIndex]
+  if (message && isAssistantMessage(message)) {
+    finalizeAssistantStreamMessage(message, state.startedAt)
+    if (!isLoggedIn()) updateLastAssistantContent(state.chatId, message.text)
+  }
+  state.destroyed = true
+  activeStreamState = null
+  streamAbortController = null
+  isStreaming.value = false
+  clearStreamRecovery()
+  scheduleAutoScroll()
+}
+
+function handleStreamFailure(state: ActiveStreamState, err: Error | StreamChatError) {
+  if (activeStreamState !== state || state.destroyed) return
+  streamAbortController = null
+  if (err instanceof StreamTerminalError ||
+      (err instanceof StreamChatError &&
+        (err.code === StreamChatErrorCode.TOKEN_LIMIT_EXCEEDED || err.code < 500))) {
+    if (err instanceof StreamChatError && err.code === StreamChatErrorCode.TOKEN_LIMIT_EXCEEDED) {
+      ElMessage.warning({ message: '今日对话额度已用尽，请明日再试或登录账号获取更多额度', duration: 5000, showClose: true })
+    }
+    const message = messages[state.assistantIndex]
+    if (message && isAssistantMessage(message)) {
+      message.isStreaming = false
+      message.isFinished = true
+      message.completed = err instanceof StreamTerminalError && err.status === 'cancelled'
+      message.renderedByStream = true
+      if (!message.text) message.text = err.message
+    }
+    state.destroyed = true
+    activeStreamState = null
+    isStreaming.value = false
+    clearStreamRecovery()
+    return
+  }
+  markStreamInterrupted(state)
+}
 
 // 从后端按页加载会话消息（page 从 1 开始；page=1 为最新一页，向上滚动加载 page=2、3... 更旧消息）
 function fetchMessages(page: number, appendToTop = false): Promise<void> {
@@ -2195,6 +2494,7 @@ function fetchMessages(page: number, appendToTop = false): Promise<void> {
         return (prompt ?? 0) + (completion ?? 0)
       }
 
+      // 接口按最新消息优先返回；聊天区需要按发送顺序从上到下展示。
       const mapped = list.map((m) => {
         let textValue: any = m.payload ?? m.content ?? ''
         // 如果是对象，优先取常见字段，再兜底为 JSON 字符串
@@ -2233,14 +2533,16 @@ function fetchMessages(page: number, appendToTop = false): Promise<void> {
         }
 
         const { reasoningText, text } = parsePayloadWithThink(textStr)
+        const completed = isCompletedMessage(m)
         // 从历史消息中提取文件URL（如果存在）
         const extractedFiles = extractFileUrls(text)
         const msg: AssistantMessage = {
           role: 'assistant',
           text,
           reasoningText: reasoningText || undefined,
-          isStreaming: false,
-          isFinished: true,
+          isStreaming: !completed,
+          isFinished: completed,
+          completed,
           isFavor: Boolean(m.isFavor ?? m.is_favor),
           timestamp: new Date(m.createdAt ?? m.createTime ?? Date.now()),
           aiAttachments: rawAttachments(m.aiAttachments ?? m.ai_attachments),
@@ -2256,12 +2558,13 @@ function fetchMessages(page: number, appendToTop = false): Promise<void> {
               : Number((m as any).thinkingTime ?? 0) || undefined
         }
         return msg
-      })
+      }).reverse()
 
       if (appendToTop) {
         // 向上翻页：在顶部追加更旧消息
         const prev = [...messages]
         messages.splice(0, messages.length, ...mapped, ...prev)
+        if (activeStreamState) activeStreamState.assistantIndex += mapped.length
         nextTick(() => {
           if (!el) return
           const newScrollHeight = el.scrollHeight
@@ -2303,11 +2606,101 @@ function loadSession() {
   if (!id) return
   currentPage.value = 1
   hasMore.value = true
-  fetchMessages(1, false)
+  fetchMessages(1, false).then(() => {
+    void restoreLatestUnfinishedAssistantMessage()
+  })
 }
 
+function findLatestUnfinishedAssistantMessage():
+  | { message: AssistantMessage; index: number }
+  | undefined {
+  let target: { message: AssistantMessage; index: number } | undefined
+  let latestTimestamp = Number.NEGATIVE_INFINITY
 
+  for (let i = 0; i < messages.length; i += 1) {
+    const candidate = messages[i]
+    if (!isAssistantMessage(candidate)) continue
+    if (candidate.completed !== false || candidate.isFinished) continue
 
+    const timestamp = new Date(candidate.timestamp ?? 0).getTime()
+    if (!target || timestamp >= latestTimestamp) {
+      target = { message: candidate, index: i }
+      latestTimestamp = timestamp
+    }
+  }
+
+  return target
+}
+
+async function findUnfinishedAssistantId(chatId: string): Promise<string | null> {
+  const { ok, json } = await apiFetch<any>(
+    '/api/list/message/1?ChatId=' + encodeURIComponent(chatId), { method: 'GET' }
+  )
+  if (!ok) return null
+  const records: any[] = json?.data?.records ?? json?.data?.content ?? []
+  const candidate = records.find((item) =>
+    String(item.messageType ?? '').toLowerCase() === 'assistant' &&
+    !isCompletedMessage(item) && item.id != null
+  )
+  return candidate ? String(candidate.id) : null
+}
+
+async function restoreLatestUnfinishedAssistantMessage() {
+  const chatId = instanceChatId
+  if (!chatId || streamAbortController || restoringStream) return
+
+  const existing = activeStreamState?.chatId === chatId && !activeStreamState.destroyed
+    ? { message: messages[activeStreamState.assistantIndex], index: activeStreamState.assistantIndex }
+    : findLatestUnfinishedAssistantMessage()
+  if (!existing?.message || !isAssistantMessage(existing.message)) return
+
+  restoringStream = true
+  try {
+    const message = existing.message
+    if (!message.messageId) message.messageId = (await findUnfinishedAssistantId(chatId)) ?? undefined
+    if (!message.messageId) return
+
+    const snapshot = await getStreamingSnapshot(chatId, message.messageId)
+    if (!snapshot) return
+    if ((Number(snapshot.seq ?? 0) || 0) >= (message.lastSeq ?? 0)) {
+      applySnapshotToAssistantMessage(message, snapshot)
+      scheduleAutoScroll()
+    }
+
+    const status = String(snapshot.status ?? 'streaming').toLowerCase()
+    const state = activeStreamState?.chatId === chatId && !activeStreamState.destroyed
+      ? activeStreamState
+      : {
+          assistantIndex: existing.index,
+          chatId,
+          destroyed: false,
+          startedAt: (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()
+        }
+    activeStreamState = state
+
+    if (status === 'done') {
+      finishStream(state)
+      return
+    }
+    if (status === 'error' || status === 'cancelled') {
+      handleStreamFailure(state, new StreamTerminalError(status))
+      return
+    }
+
+    isStreaming.value = true
+    streamAbortController = resubscribeStream(chatId, message.messageId, message.lastSeq ?? 0, {
+      onChunk: (content) => handleStreamChunk(state, content),
+      onDone: () => finishStream(state),
+      onError: (err) => handleStreamFailure(state, err)
+    })
+    clearStreamRecovery()
+  } catch (error) {
+    console.error('恢复流式对话失败:', error)
+  } finally {
+    restoringStream = false
+    if (activeStreamState && !streamAbortController) scheduleStreamRecovery()
+  }
+}
 
 
 // 发送消息
@@ -2345,6 +2738,7 @@ function handleSend() {
       text: '',
       isStreaming: true,
       isFinished: false,
+      completed: false,
       timestamp: new Date(),
       isImageLoading: isImageGenMode.value || undefined,
       isImageGen: isImageGenMode.value || undefined,
@@ -3008,6 +3402,8 @@ function regenerateMessage(index: number) {
       assistantMsg.text = ''
       assistantMsg.isStreaming = true
       assistantMsg.isFinished = false
+      assistantMsg.completed = false
+      assistantMsg.lastSeq = 0
       assistantMsg.reasoningText = ''
       assistantMsg.thinkBlocks = []
       assistantMsg.attachmentLoading = false
@@ -3045,11 +3441,6 @@ function exportChat() {
 }
 
 function goHome() {
-  if (streamAbortController) {
-    streamAbortController.abort()
-    streamAbortController = null
-    isStreaming.value = false
-  }
   // 清理输入区与附件状态，避免从对话页返回首页后仍沿用上一会话的附件/消息
   currentMessage.value = ''
   attachments.value = []
@@ -3060,6 +3451,7 @@ function goHome() {
 
 // 停止流式输出
 async function stopStreaming() {
+  clearStreamRecovery()
   if (streamAbortController) {
     streamAbortController.abort()
     streamAbortController = null
@@ -3083,6 +3475,7 @@ async function stopStreaming() {
 
       currentMsg.isStreaming = false
       currentMsg.isFinished = true
+      currentMsg.completed = true
       currentMsg.renderedByStream = true
       currentMsg.isImageLoading = false
       if (currentMsg.isThinkingPhase && currentMsg.thinkingStartedAt && 
@@ -3111,6 +3504,7 @@ async function connectAndStream(
   attachmentIds: string[],
   assistantIndex: number
 ) {
+  clearStreamRecovery()
   // 游客：先确保已调用 /api/anon/identify，拿到 anonId（本地缓存 + Header 传递）
   if (!isLoggedIn()) {
     try {
@@ -3130,6 +3524,7 @@ async function connectAndStream(
 
   activeStreamState = {
     assistantIndex,
+    chatId,
     destroyed: false,
     startedAt: (typeof performance !== 'undefined' && performance.now)
       ? performance.now()
@@ -3137,8 +3532,9 @@ async function connectAndStream(
   }
   const token = getToken()
 
+  const state = activeStreamState
   nextTick(() => {
-    if (!activeStreamState || activeStreamState.destroyed) return
+    if (!state || activeStreamState !== state || state.destroyed) return
     streamAbortController = streamChat(
       {
         chatId,
@@ -3154,211 +3550,9 @@ async function connectAndStream(
         isEcharts: isEchartsMode.value
       },
       {
-        onChunk: (content: string) => {
-          if (!activeStreamState || activeStreamState.destroyed) return
-          const currentMsg = messages[activeStreamState.assistantIndex]
-          if (!currentMsg || !isAssistantMessage(currentMsg)) return
-
-          // 新后端：SSE data 为 JSON，支持 { text?, reasoning? } 或 { type: "text"|"reasoning", content }（reasoning 复用 Think；text 流式解析为 markdown）
-          let parsed: any = null
-          try {
-            parsed = JSON.parse(content)
-          } catch {
-            parsed = null
-          }
-
-          const hasStructuredChunk =
-            parsed &&
-            typeof parsed === 'object' &&
-            (('text' in parsed || 'reasoning' in parsed) || ('type' in parsed && 'content' in parsed))
-
-          if (hasStructuredChunk) {
-            let { textChunk, reasoningChunk } = normalizeStreamChunk(parsed)
-
-            const textStripped = stripAttachmentLoadingToken(String(textChunk))
-            const reasoningStripped = stripAttachmentLoadingToken(String(reasoningChunk))
-            if (textStripped.hadToken || reasoningStripped.hadToken) currentMsg.attachmentLoading = true
-            textChunk = textStripped.cleaned
-            reasoningChunk = reasoningStripped.cleaned
-
-            if (reasoningChunk) {
-              let parser = thinkParsers.get(currentMsg)
-              if (!parser) {
-                parser = new PreParse()
-                thinkParsers.set(currentMsg, parser)
-                currentMsg.reasoningText = ''
-                currentMsg.thinkBlocks = []
-                // 添加 <think> 开始标签
-                const startTag = '<think>'
-                parser.appendChunk(startTag)
-              }
-              const blocks = parser.appendChunk(String(reasoningChunk))
-              currentMsg.reasoningText += String(reasoningChunk)
-              currentMsg.thinkBlocks = blocks
-
-              // 推理片段首次到达时开始计时
-              if (!currentMsg.thinkingStartedAt) {
-                const now = (typeof performance !== 'undefined' && performance.now)
-                  ? performance.now()
-                  : Date.now()
-                currentMsg.thinkingStartedAt = now
-                currentMsg.isThinkingPhase = true
-              }
-            }
-
-            if (textChunk) {
-              currentMsg.attachmentLoading = false
-              const textStr = String(textChunk)
-              currentMsg.text += textStr
-              if (textStr.includes('![')) {
-                currentMsg.isImageLoading = false
-              }
-              if (containsImageGenFailure(textStr)) {
-                currentMsg.isImageLoading = false
-              }
-              // 生成文件可能是 Markdown ![](url) 或纯下载地址，都提取并展示文件卡片
-              const extractedFiles = extractFileUrls(currentMsg.text)
-              if (extractedFiles.length > 0) {
-                currentMsg.generatedFiles = extractedFiles
-              }
-
-              // 首次收到正文内容时结束推理计时（若后端未给 thinkingTime）
-              if (currentMsg.isThinkingPhase && currentMsg.thinkingStartedAt && (!currentMsg.thinkingTime || currentMsg.thinkingTime <= 0)) {
-                const end = (typeof performance !== 'undefined' && performance.now)
-                  ? performance.now()
-                  : Date.now()
-                const ms = Math.max(0, Math.round(end - currentMsg.thinkingStartedAt))
-                if (ms > 0) {
-                  currentMsg.thinkingTime = ms
-                }
-              }
-              currentMsg.isThinkingPhase = false
-            }
-            if (reasoningChunk) {
-              currentMsg.attachmentLoading = false
-            }
-          } else {
-            // 兼容旧格式或纯文本：直接增量文本
-            const rawStr = String(content)
-            const { cleaned: rawCleaned, hadToken: rawHadToken } = stripAttachmentLoadingToken(rawStr)
-            if (rawHadToken) currentMsg.attachmentLoading = true
-            if (rawCleaned) {
-              currentMsg.attachmentLoading = false
-              if (rawCleaned.startsWith(currentMsg.text)) {
-                const delta = rawCleaned.slice(currentMsg.text.length)
-                currentMsg.text += delta
-              } else {
-                currentMsg.text += rawCleaned
-              }
-            }
-            if (rawStr.includes('![')) {
-              currentMsg.isImageLoading = false
-            }
-            if (containsImageGenFailure(rawStr)) {
-              currentMsg.isImageLoading = false
-            }
-            const extractedFiles = extractFileUrls(currentMsg.text)
-            if (extractedFiles.length > 0) {
-              currentMsg.generatedFiles = extractedFiles
-            }
-          }
-
-          scheduleAutoScroll()
-        },
-        onDone: () => {
-          if (activeStreamState && !activeStreamState.destroyed) {
-            const currentMsg = messages[activeStreamState.assistantIndex]
-            if (currentMsg && isAssistantMessage(currentMsg)) {
-              currentMsg.attachmentLoading = false
-              currentMsg.isImageLoading = false
-              // 最终再提取一次文件 URL（支持 Markdown ![](url) 或纯地址）
-              if (currentMsg.text) {
-                const extractedFiles = extractFileUrls(currentMsg.text)
-                if (extractedFiles.length > 0) {
-                  currentMsg.generatedFiles = extractedFiles
-                }
-              }
-              // 如果推理模式且有推理内容，添加结束标签
-              if (currentMsg.reasoningText && currentMsg.thinkBlocks) {
-                const parser = thinkParsers.get(currentMsg)
-                if (parser) {
-                  // 检查是否有未完成的 think block
-                  const hasUnfinishedBlock = currentMsg.thinkBlocks.some(
-                    (b) => b.symbol.toLowerCase() === '<think>' && !b.finished
-                  )
-                  if (hasUnfinishedBlock) {
-                    // 添加 </think> 结束标签
-                    const endTag = '</think>'
-                    const blocks = parser.appendChunk(endTag)
-                    currentMsg.thinkBlocks = blocks
-                  }
-                }
-              }
-              // 若后端未提供 cost，则前端按流式时间估算一次（毫秒）
-              if (!currentMsg.cost || currentMsg.cost <= 0) {
-                const end = (typeof performance !== 'undefined' && performance.now)
-                  ? performance.now()
-                  : Date.now()
-                const ms = Math.max(0, Math.round(end - activeStreamState.startedAt))
-                if (ms > 0) currentMsg.cost = ms
-              }
-              // 流式结束后重置推理阶段标记
-              currentMsg.isThinkingPhase = false
-              currentMsg.thinkingStartedAt = undefined
-              
-              currentMsg.isStreaming = false
-              currentMsg.isFinished = true
-              currentMsg.renderedByStream = true
-              if (!isLoggedIn()) {
-                const id = (route.query.id as string) || ''
-                if (id) updateLastAssistantContent(id, currentMsg.text)
-              }
-            }
-            activeStreamState.destroyed = true
-            activeStreamState = null
-          }
-          isStreaming.value = false
-          streamAbortController = null
-          scheduleAutoScroll()
-        },
-        onError: (err: Error | StreamChatError) => {
-          console.error('流式对话错误:', err)
-          const isTokenLimitExceeded =
-            err instanceof StreamChatError && err.code === StreamChatErrorCode.TOKEN_LIMIT_EXCEEDED
-          if (isTokenLimitExceeded) {
-            ElMessage.warning({
-              message: '今日对话额度已用尽，请明日再试或登录账号获取更多额度',
-              duration: 5000,
-              showClose: true
-            })
-          }
-          if (activeStreamState && !activeStreamState.destroyed) {
-            const currentMsg = messages[activeStreamState.assistantIndex]
-            if (currentMsg && isAssistantMessage(currentMsg)) {
-              if (isTokenLimitExceeded) {
-                currentMsg.text =
-                  '今日对话额度已用尽。请明日再试，或登录账号获取更多额度。'
-              } else {
-                currentMsg.text = currentMsg.text || '❌ 对话过程中发生错误，请重试'
-              }
-              currentMsg.isImageLoading = false
-              // 错误时也记录已用时（如果此前没有 cost）
-              if (!currentMsg.cost || currentMsg.cost <= 0) {
-                const end = (typeof performance !== 'undefined' && performance.now)
-                  ? performance.now()
-                  : Date.now()
-                const ms = Math.max(0, Math.round(end - activeStreamState.startedAt))
-                if (ms > 0) currentMsg.cost = ms
-              }
-              currentMsg.isStreaming = false
-              currentMsg.isFinished = true
-            }
-            activeStreamState.destroyed = true
-            activeStreamState = null
-          }
-          isStreaming.value = false
-          streamAbortController = null
-        }
+        onChunk: (content: string) => handleStreamChunk(state, content),
+        onDone: () => finishStream(state),
+        onError: (err: Error | StreamChatError) => handleStreamFailure(state, err)
       }
     )
   })
@@ -3371,6 +3565,7 @@ async function connectAndRegenerate(
   assistantMessageId: string,
   assistantIndex: number
 ) {
+  clearStreamRecovery()
   // 游客：先确保已调用 /api/anon/identify，拿到 anonId（本地缓存 + Header 传递）
   if (!isLoggedIn()) {
     try {
@@ -3390,6 +3585,7 @@ async function connectAndRegenerate(
 
   activeStreamState = {
     assistantIndex,
+    chatId,
     destroyed: false,
     startedAt: (typeof performance !== 'undefined' && performance.now)
       ? performance.now()
@@ -3397,8 +3593,9 @@ async function connectAndRegenerate(
   }
   const token = getToken()
 
+  const state = activeStreamState
   nextTick(() => {
-    if (!activeStreamState || activeStreamState.destroyed) return
+    if (!state || activeStreamState !== state || state.destroyed) return
     streamAbortController = streamRegenerate(
       {
         chatId,
@@ -3407,211 +3604,9 @@ async function connectAndRegenerate(
         token
       },
       {
-        onChunk: (content: string) => {
-          if (!activeStreamState || activeStreamState.destroyed) return
-          const currentMsg = messages[activeStreamState.assistantIndex]
-          if (!currentMsg || !isAssistantMessage(currentMsg)) return
-
-          // 新后端：SSE data 为 JSON，支持 { text?, reasoning? } 或 { type: "text"|"reasoning", content }（reasoning 复用 Think；text 流式解析为 markdown）
-          let parsed: any = null
-          try {
-            parsed = JSON.parse(content)
-          } catch {
-            parsed = null
-          }
-
-          const hasStructuredChunk =
-            parsed &&
-            typeof parsed === 'object' &&
-            (('text' in parsed || 'reasoning' in parsed) || ('type' in parsed && 'content' in parsed))
-
-          if (hasStructuredChunk) {
-            let { textChunk, reasoningChunk } = normalizeStreamChunk(parsed)
-
-            const textStripped = stripAttachmentLoadingToken(String(textChunk))
-            const reasoningStripped = stripAttachmentLoadingToken(String(reasoningChunk))
-            if (textStripped.hadToken || reasoningStripped.hadToken) currentMsg.attachmentLoading = true
-            textChunk = textStripped.cleaned
-            reasoningChunk = reasoningStripped.cleaned
-
-            if (reasoningChunk) {
-              let parser = thinkParsers.get(currentMsg)
-              if (!parser) {
-                parser = new PreParse()
-                thinkParsers.set(currentMsg, parser)
-                currentMsg.reasoningText = ''
-                currentMsg.thinkBlocks = []
-                // 添加 <think> 开始标签
-                const startTag = '<think>'
-                parser.appendChunk(startTag)
-              }
-              const blocks = parser.appendChunk(String(reasoningChunk))
-              currentMsg.reasoningText += String(reasoningChunk)
-              currentMsg.thinkBlocks = blocks
-
-              // 推理片段首次到达时开始计时
-              if (!currentMsg.thinkingStartedAt) {
-                const now = (typeof performance !== 'undefined' && performance.now)
-                  ? performance.now()
-                  : Date.now()
-                currentMsg.thinkingStartedAt = now
-                currentMsg.isThinkingPhase = true
-              }
-            }
-
-            if (textChunk) {
-              currentMsg.attachmentLoading = false
-              const textStr = String(textChunk)
-              currentMsg.text += textStr
-              if (textStr.includes('![')) {
-                currentMsg.isImageLoading = false
-              }
-              if (containsImageGenFailure(textStr)) {
-                currentMsg.isImageLoading = false
-              }
-              // 生成文件可能是 Markdown ![](url) 或纯下载地址，都提取并展示文件卡片
-              const extractedFiles = extractFileUrls(currentMsg.text)
-              if (extractedFiles.length > 0) {
-                currentMsg.generatedFiles = extractedFiles
-              }
-
-              // 首次收到正文内容时结束推理计时（若后端未给 thinkingTime）
-              if (currentMsg.isThinkingPhase && currentMsg.thinkingStartedAt && (!currentMsg.thinkingTime || currentMsg.thinkingTime <= 0)) {
-                const end = (typeof performance !== 'undefined' && performance.now)
-                  ? performance.now()
-                  : Date.now()
-                const ms = Math.max(0, Math.round(end - currentMsg.thinkingStartedAt))
-                if (ms > 0) {
-                  currentMsg.thinkingTime = ms
-                }
-              }
-              currentMsg.isThinkingPhase = false
-            }
-            if (reasoningChunk) {
-              currentMsg.attachmentLoading = false
-            }
-          } else {
-            // 兼容旧格式或纯文本：直接增量文本
-            const rawStr = String(content)
-            const { cleaned: rawCleaned, hadToken: rawHadToken } = stripAttachmentLoadingToken(rawStr)
-            if (rawHadToken) currentMsg.attachmentLoading = true
-            if (rawCleaned) {
-              currentMsg.attachmentLoading = false
-              if (rawCleaned.startsWith(currentMsg.text)) {
-                const delta = rawCleaned.slice(currentMsg.text.length)
-                currentMsg.text += delta
-              } else {
-                currentMsg.text += rawCleaned
-              }
-            }
-            if (rawStr.includes('![')) {
-              currentMsg.isImageLoading = false
-            }
-            if (containsImageGenFailure(rawStr)) {
-              currentMsg.isImageLoading = false
-            }
-            const extractedFiles = extractFileUrls(currentMsg.text)
-            if (extractedFiles.length > 0) {
-              currentMsg.generatedFiles = extractedFiles
-            }
-          }
-
-          scheduleAutoScroll()
-        },
-        onDone: () => {
-          if (activeStreamState && !activeStreamState.destroyed) {
-            const currentMsg = messages[activeStreamState.assistantIndex]
-            if (currentMsg && isAssistantMessage(currentMsg)) {
-              currentMsg.attachmentLoading = false
-              currentMsg.isImageLoading = false
-              // 最终再提取一次文件 URL（支持 Markdown ![](url) 或纯地址）
-              if (currentMsg.text) {
-                const extractedFiles = extractFileUrls(currentMsg.text)
-                if (extractedFiles.length > 0) {
-                  currentMsg.generatedFiles = extractedFiles
-                }
-              }
-              // 如果推理模式且有推理内容，添加结束标签
-              if (currentMsg.reasoningText && currentMsg.thinkBlocks) {
-                const parser = thinkParsers.get(currentMsg)
-                if (parser) {
-                  // 检查是否有未完成的 think block
-                  const hasUnfinishedBlock = currentMsg.thinkBlocks.some(
-                    (b) => b.symbol.toLowerCase() === '<think>' && !b.finished
-                  )
-                  if (hasUnfinishedBlock) {
-                    // 添加 </think> 结束标签
-                    const endTag = '</think>'
-                    const blocks = parser.appendChunk(endTag)
-                    currentMsg.thinkBlocks = blocks
-                  }
-                }
-              }
-              // 若后端未提供 cost，则前端按流式时间估算一次（毫秒）
-              if (!currentMsg.cost || currentMsg.cost <= 0) {
-                const end = (typeof performance !== 'undefined' && performance.now)
-                  ? performance.now()
-                  : Date.now()
-                const ms = Math.max(0, Math.round(end - activeStreamState.startedAt))
-                if (ms > 0) currentMsg.cost = ms
-              }
-              // 流式结束后重置推理阶段标记
-              currentMsg.isThinkingPhase = false
-              currentMsg.thinkingStartedAt = undefined
-              
-              currentMsg.isStreaming = false
-              currentMsg.isFinished = true
-              currentMsg.renderedByStream = true
-              if (!isLoggedIn()) {
-                const id = (route.query.id as string) || ''
-                if (id) updateLastAssistantContent(id, currentMsg.text)
-              }
-            }
-            activeStreamState.destroyed = true
-            activeStreamState = null
-          }
-          isStreaming.value = false
-          streamAbortController = null
-          scheduleAutoScroll()
-        },
-        onError: (err: Error | StreamChatError) => {
-          console.error('重新生成回复错误:', err)
-          const isTokenLimitExceeded =
-            err instanceof StreamChatError && err.code === StreamChatErrorCode.TOKEN_LIMIT_EXCEEDED
-          if (isTokenLimitExceeded) {
-            ElMessage.warning({
-              message: '今日对话额度已用尽，请明日再试或登录账号获取更多额度',
-              duration: 5000,
-              showClose: true
-            })
-          }
-          if (activeStreamState && !activeStreamState.destroyed) {
-            const currentMsg = messages[activeStreamState.assistantIndex]
-            if (currentMsg && isAssistantMessage(currentMsg)) {
-              if (isTokenLimitExceeded) {
-                currentMsg.text =
-                  '今日对话额度已用尽。请明日再试，或登录账号获取更多额度。'
-              } else {
-                currentMsg.text = currentMsg.text || '❌ 重新生成过程中发生错误，请重试'
-              }
-              currentMsg.isImageLoading = false
-              // 错误时也记录已用时（如果此前没有 cost）
-              if (!currentMsg.cost || currentMsg.cost <= 0) {
-                const end = (typeof performance !== 'undefined' && performance.now)
-                  ? performance.now()
-                  : Date.now()
-                const ms = Math.max(0, Math.round(end - activeStreamState.startedAt))
-                if (ms > 0) currentMsg.cost = ms
-              }
-              currentMsg.isStreaming = false
-              currentMsg.isFinished = true
-            }
-            activeStreamState.destroyed = true
-            activeStreamState = null
-          }
-          isStreaming.value = false
-          streamAbortController = null
-        }
+        onChunk: (content: string) => handleStreamChunk(state, content),
+        onDone: () => finishStream(state),
+        onError: (err: Error | StreamChatError) => handleStreamFailure(state, err)
       }
     )
   })
@@ -3639,6 +3634,11 @@ function ensureFirstMessageStream() {
   if (firstMessage && firstMessage.trim()) {
     // 防止重复调用：标记当前 chatId 正在处理
     ensuringFirstMessageChatId.value = id
+
+    // q 只用于首次导航。刷新页面时若保留在 URL 中，会再次 POST 同一条消息。
+    const remainingQuery = { ...route.query }
+    delete remainingQuery.q
+    void router.replace({ path: route.path, query: remainingQuery, hash: route.hash })
     
     // 有首条消息，需要自动发起流式对话
     const messageId = generate().toString()
@@ -3656,6 +3656,7 @@ function ensureFirstMessageStream() {
       text: '', 
       isStreaming: true,
       isFinished: false,
+      completed: false,
       timestamp: new Date(),
       isImageLoading: isImageGenMode.value || undefined,
       isImageGen: isImageGenMode.value || undefined
@@ -3669,6 +3670,13 @@ function ensureFirstMessageStream() {
     // 先加载历史消息，然后追加首条消息并发起流式对话
     fetchMessages(1, false)
       .then(() => {
+        // 已写入历史的首条消息说明请求此前已发起（例如流式输出时刷新）。
+        // 此时沿用历史记录并恢复未完成的回复，不能再次创建用户消息。
+        if (messages.some((item) => item.role === 'user')) {
+          void restoreLatestUnfinishedAssistantMessage()
+          ensuringFirstMessageChatId.value = null
+          return
+        }
         // 历史消息加载完成后，追加首条消息和助手回复
         messages.push(userMessage, assistantMessage)
         nextTick(() => {
@@ -3703,83 +3711,26 @@ function ensureFirstMessageStream() {
   }
 }
 
-// 标记是否是首次加载
-const isFirstMount = ref(true)
-
 // 生命周期
 onMounted(() => {
+  if (typeof window !== 'undefined') {
+    window.addEventListener('online', handleBrowserOnline)
+    window.addEventListener('offline', handleBrowserOffline)
+  }
   ensureFirstMessageStream()
-  // 标记首次加载完成
-  nextTick(() => {
-    isFirstMount.value = false
-  })
   // 注册全局点击事件，用于点击空白处关闭「更多操作」菜单
   if (typeof document !== 'undefined') {
     document.addEventListener('click', handleGlobalClickForMessageMoreMenu)
   }
 })
 
-// 从首页进入会话（无 id → 有 id）：清空并触发首条消息流
-watch(
-  () => route.query.id,
-  (newId, oldId) => {
-    if (newId && !oldId && !isFirstMount.value) {
-      messages.splice(0, messages.length)
-      ensuringFirstMessageChatId.value = null
-      ensureFirstMessageStream()
-      return
-    }
-  }
-)
-
-// 监听路由变化（只在会话切换时触发，不在首次加载时触发）
-watch(
-  () => route.query.id,
-  (newId, oldId) => {
-    if (isFirstMount.value) return
-    if (newId && newId !== oldId && oldId) {
-      // 如果新 ID 已经在处理首条消息，说明是路由更新（如后端返回新 chatId），不需要重新加载
-      const newIdStr = typeof newId === 'string' ? newId : (Array.isArray(newId) ? newId[0] : '')
-      const oldIdStr = typeof oldId === 'string' ? oldId : (Array.isArray(oldId) ? oldId[0] : '')
-      if (ensuringFirstMessageChatId.value === newIdStr || ensuringFirstMessageChatId.value === oldIdStr) {
-        // 只更新标志，不重新加载
-        ensuringFirstMessageChatId.value = newIdStr
-        return
-      }
-      
-      // 停止当前的流式输出
-      if (streamAbortController) {
-        streamAbortController.abort()
-        streamAbortController = null
-      }
-      
-      // 清理流状态
-      activeStreamState = null
-      
-      // 重置状态
-      isStreaming.value = false
-      messages.splice(0, messages.length)
-      currentMessage.value = ''
-      attachments.value = []
-      currentMessageId.value = ''
-      shouldAutoScroll.value = true
-      
-      // 重置分页状态
-      currentPage.value = 1
-      hasMore.value = true
-      isLoadingMore.value = false
-      messagesLoading.value = false
-      
-      // 重置确保首条消息的标志
-      ensuringFirstMessageChatId.value = null
-      
-      // 重新加载会话（这会触发 /api/list/message/{page} 请求）
-      ensureFirstMessageStream()
-    }
-  }
-)
-
 onBeforeUnmount(() => {
+  setChatRunning(instanceChatId, false)
+  clearStreamRecovery()
+  if (typeof window !== 'undefined') {
+    window.removeEventListener('online', handleBrowserOnline)
+    window.removeEventListener('offline', handleBrowserOffline)
+  }
   stopDictation()
   if (inputMenuCloseCleanup) {
     inputMenuCloseCleanup()

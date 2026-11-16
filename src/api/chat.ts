@@ -26,6 +26,13 @@ export class StreamChatError extends Error {
   }
 }
 
+export class StreamTerminalError extends Error {
+  constructor(public readonly status: 'error' | 'cancelled') {
+    super(status === 'cancelled' ? '对话已取消' : '生成失败')
+    this.name = 'StreamTerminalError'
+  }
+}
+
 export interface StreamChatParams {
   chatId: string
   message: string
@@ -54,7 +61,117 @@ export interface StreamChatCallbacks {
   onDone?: () => void
 }
 
+export interface StreamingSnapshot {
+  chatId?: string
+  messageId?: string | number
+  content?: string
+  text?: string
+  reasoning?: string
+  status?: string
+  completed?: boolean
+  seq?: number | null
+}
+
 const CHAT_ASYNC_URL = '/api/ai/chat/async/'
+
+function buildStreamHeaders(token?: string): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json'
+  }
+  if (token) {
+    headers.Authorization = String(token)
+  } else {
+    const annoId = getStoredAnnoId()
+    if (annoId) {
+      headers['Anno-Id'] = annoId
+    }
+  }
+  return headers
+}
+
+async function consumeSseResponse(
+  response: Response,
+  callbacks: StreamChatCallbacks
+): Promise<void> {
+  if (!response.ok) {
+    const err = await parseStreamChatError(response)
+    throw err
+  }
+  if (!response.body) throw new Error('Response body is null')
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+
+  try {
+    let buffer = ''
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) {
+        throw new Error('流式连接已结束，尚未收到完成事件')
+      }
+      buffer += decoder.decode(value, { stream: true })
+      buffer = buffer.replace(/\r\n/g, '\n')
+
+      let eventEnd
+      while ((eventEnd = buffer.indexOf('\n\n')) !== -1) {
+        const rawEvent = buffer.slice(0, eventEnd)
+        buffer = buffer.slice(eventEnd + 2)
+
+        const lines = rawEvent.split('\n')
+        const dataLines: string[] = []
+
+        for (const line of lines) {
+          if (!line.startsWith('data:')) continue
+          const content = line.slice(5).trim()
+          if (content === '[DONE]') {
+            callbacks.onDone?.()
+            return
+          }
+          if (content) {
+            dataLines.push(content)
+          }
+        }
+
+        if (dataLines.length > 0) {
+          const content = dataLines.join('\n')
+          let event: { eventType?: string } | null = null
+          try {
+            event = JSON.parse(content)
+          } catch {
+            // 兼容旧格式纯文本增量。
+          }
+          if (event?.eventType === 'done') {
+            callbacks.onDone?.()
+            return
+          }
+          if (event?.eventType === 'error' || event?.eventType === 'cancelled') {
+            callbacks.onError?.(new StreamTerminalError(event.eventType))
+            return
+          }
+          callbacks.onChunk(content)
+        }
+      }
+    }
+  } catch (e) {
+    if (e instanceof Error && e.name === 'AbortError') return
+    callbacks.onError?.(e instanceof Error ? e : new Error(String(e)))
+    if (typeof reader.cancel === 'function') {
+      reader.cancel()
+    }
+  }
+}
+
+function handleStreamError(error: unknown, callbacks: StreamChatCallbacks) {
+  if (error instanceof Error && error.name === 'AbortError') return
+  const err =
+    error instanceof StreamChatError
+      ? error
+      : error instanceof Error
+        ? error
+        : new Error(String(error))
+  callbacks.onError?.(err)
+}
 
 /** 解析非 2xx 响应为 StreamChatError，便于前端区分 Token 超限等 */
 async function parseStreamChatError(response: Response): Promise<StreamChatError> {
@@ -104,91 +221,16 @@ export function streamChat(
     isEcharts: params.isEcharts ?? false
   }
 
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json'
-  }
-  if (token) {
-    headers.Authorization = String(token)
-  } else {
-    // 未登录：如果已有本地缓存的 annoId，则携带到请求头
-    const annoId = getStoredAnnoId()
-    if (annoId) {
-      headers['Anno-Id'] = annoId
-    }
-  }
-
   apiFetchRaw(CHAT_ASYNC_URL, {
     method: 'POST',
     credentials: 'include',
-    headers,
+    headers: buildStreamHeaders(token),
     body: JSON.stringify(requestBody),
     signal: controller.signal
   })
-    .then(async (response) => {
-      if (!response.ok) {
-        const err = await parseStreamChatError(response)
-        throw err
-      }
-      if (!response.body) throw new Error('Response body is null')
-
-      const reader = response.body.getReader()
-      const decoder = new TextDecoder()
-      try {
-        let buffer = ''
-
-        while (true) {
-          const { done, value } = await reader.read()   
-          if (done) { 
-            callbacks.onDone?.()
-            return
-          }
-          buffer += decoder.decode(value, { stream: true })
-          
-          let eventEnd
-          while ((eventEnd = buffer.indexOf('\n\n')) !== -1) {
-            const rawEvent = buffer.slice(0, eventEnd)
-            buffer = buffer.slice(eventEnd + 2)
-          
-            const lines = rawEvent.split('\n')
-            const dataLines: string[] = []
-            
-            for (const line of lines) {
-              if (line.startsWith('data:')) {
-                let content = line.slice(5).trim()
-                if (content === '[DONE]') {
-                  callbacks.onDone?.()
-                  return
-                }
-                if (content) {
-                  dataLines.push(content)
-                }
-              }
-            }
-            
-            if (dataLines.length > 0) {
-              let data = dataLines.join('\n')
-              callbacks.onChunk(data)
-            }
-          }
-        }
-      } 
-      catch (e) {
-          if (e instanceof Error && e.name === 'AbortError') return
-          callbacks.onError?.(e instanceof Error ? e : new Error(String(e)))
-          if (reader && typeof reader.cancel === 'function') {
-            reader.cancel()
-          }
-        }
-      })
+    .then((response) => consumeSseResponse(response, callbacks))
     .catch((error) => {
-      if (error instanceof Error && error.name === 'AbortError') return
-      const err =
-        error instanceof StreamChatError
-          ? error
-          : error instanceof Error
-            ? error
-            : new Error(String(error))
-      callbacks.onError?.(err)
+      handleStreamError(error, callbacks)
     })
 
   return controller
@@ -282,90 +324,69 @@ export function streamRegenerate(
 
   const REGENERATE_URL = '/api/ai/chat/regenerate'
 
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json'
-  }
-  if (token) {
-    headers.Authorization = String(token)
-  } else {
-    const annoId = getStoredAnnoId()
-    if (annoId) {
-      headers['Anno-Id'] = annoId
-    }
-  }
-
   apiFetchRaw(REGENERATE_URL, {
     method: 'POST',
     credentials: 'include',
-    headers,
+    headers: buildStreamHeaders(token),
     body: requestBodyStr,
     signal: controller.signal
   })
-    .then(async (response) => {
-      if (!response.ok) {
-        const err = await parseStreamChatError(response)
-        throw err
-      }
-      if (!response.body) throw new Error('Response body is null')
-
-      const reader = response.body.getReader()
-      const decoder = new TextDecoder()
-      try {
-        let buffer = ''
-
-        while (true) {
-          const { done, value } = await reader.read()   
-          if (done) { 
-            callbacks.onDone?.()
-            return
-          }
-          buffer += decoder.decode(value, { stream: true })
-          
-          let eventEnd
-          while ((eventEnd = buffer.indexOf('\n\n')) !== -1) {
-            const rawEvent = buffer.slice(0, eventEnd)
-            buffer = buffer.slice(eventEnd + 2)
-          
-            const lines = rawEvent.split('\n')
-            const dataLines: string[] = []
-            
-            for (const line of lines) {
-              if (line.startsWith('data:')) {
-                let content = line.slice(5).trim()
-                if (content === '[DONE]') {
-                  callbacks.onDone?.()
-                  return
-                }
-                if (content) {
-                  dataLines.push(content)
-                }
-              }
-            }
-            
-            if (dataLines.length > 0) {
-              let data = dataLines.join('\n')
-              callbacks.onChunk(data)
-            }
-          }
-        }
-      } 
-      catch (e) {
-          if (e instanceof Error && e.name === 'AbortError') return
-          callbacks.onError?.(e instanceof Error ? e : new Error(String(e)))
-          if (reader && typeof reader.cancel === 'function') {
-            reader.cancel()
-          }
-        }
-      })
+    .then((response) => consumeSseResponse(response, callbacks))
     .catch((error) => {
-      if (error instanceof Error && error.name === 'AbortError') return
-      const err =
-        error instanceof StreamChatError
-          ? error
-          : error instanceof Error
-            ? error
-            : new Error(String(error))
-      callbacks.onError?.(err)
+      handleStreamError(error, callbacks)
+    })
+
+  return controller
+}
+
+export async function getStreamingSnapshot(
+  chatId: string,
+  messageId: string | number
+): Promise<StreamingSnapshot | null> {
+  const query =
+    '/api/ai/snapshot?chatId=' +
+    encodeURIComponent(String(chatId)) +
+    '&messageId=' +
+    encodeURIComponent(String(messageId))
+
+  const response = await apiFetchRaw(query, {
+    method: 'GET',
+    credentials: 'include'
+  })
+
+  if (response.status === 404) {
+    return null
+  }
+  if (!response.ok) {
+    throw new Error(`获取流式快照失败: ${response.status}`)
+  }
+
+  return (await response.json()) as StreamingSnapshot
+}
+
+export function resubscribeStream(
+  chatId: string,
+  messageId: string | number,
+  lastSeq: number,
+  callbacks: StreamChatCallbacks
+): AbortController {
+  const controller = new AbortController()
+  const query =
+    '/api/ai/resubscribe?chatId=' +
+    encodeURIComponent(String(chatId)) +
+    '&messageId=' +
+    encodeURIComponent(String(messageId)) +
+    '&lastSeq=' +
+    encodeURIComponent(String(lastSeq))
+
+  apiFetchRaw(query, {
+    method: 'GET',
+    credentials: 'include',
+    signal: controller.signal
+  })
+    .then((response) => consumeSseResponse(response, callbacks))
+    .catch((error) => {
+      handleStreamError(error, callbacks)
     })
 
   return controller

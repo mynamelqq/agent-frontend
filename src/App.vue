@@ -131,6 +131,13 @@
                   <span class="session-title-text">
                     {{ session.title || t('新对话', 'New Chat') }}
                   </span>
+                  <span
+                    v-if="runningChatIds.has(session.id)"
+                    class="session-running-indicator"
+                    role="status"
+                    :aria-label="t('正在生成回复', 'Generating reply')"
+                    :title="t('正在生成回复', 'Generating reply')"
+                  ></span>
                 </div>
               </div>
             </div>
@@ -271,7 +278,14 @@
           <span class="mobile-topbar-brand-text">ChatUI Pro</span>
         </button>
       </div>
-      <router-view />
+      <router-view v-slot="{ Component, route: viewRoute }">
+        <KeepAlive include="Chat">
+          <component
+            :is="Component"
+            :key="viewRoute.path === '/' ? `chat:${String(viewRoute.query.id || 'home')}` : viewRoute.path"
+          />
+        </KeepAlive>
+      </router-view>
     </main>
 
     <!-- 📱 移动端遮罩 -->
@@ -592,6 +606,7 @@ import AuthModal from './components/AuthModal.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
 import EchartsRenderer from './components/EchartsRenderer.vue'
 import { useUiLanguage } from './composables/useUiLanguage'
+import { runningChatIds } from './stores/chat-runs'
 
 // 路由与状态
 const router = useRouter()

@@ -36,99 +36,45 @@
 
             <!-- AI 消息 -->
             <div v-else class="message-bubble assistant">
-              <!-- 按“推理阶段 step”顺序渲染：推理卡片 -> 工具卡片 -> 推理卡片 -> ... -->
-              <template v-for="(step, si) in (msg.steps || [])" :key="'step-' + si">
-                <Think
-                  v-if="step.reasoning"
-                  :thinkchunk="step.reasoning"
-                  :thinking="false"
-                  :thinking-time="step.thinkingTime"
-                  label="Thought"
-                />
-                <template v-for="(tc, ti) in (step.tools || [])" :key="'tc-' + si + '-' + ti">
-                  <div v-if="isFileTool(tc.toolName) && getParsedFiles(tc).length" class="generated-files-block">
-                    <GeneratedFileCard
-                      v-for="(file, fi) in getParsedFiles(tc)"
-                      :key="fi"
-                      :fileName="file.fileName"
-                      :fileType="file.fileType"
-                      :url="file.url"
-                      :contentBase64="file.contentBase64"
-                      :mimeType="file.mimeType"
-                      :size="file.size"
-                    />
-                  </div>
-                  <div v-else-if="isFileTool(tc.toolName) && !tc.result" class="file-tool-loading">
-                    <span class="file-tool-loading-icon">⏳</span>
-                    <span>正在生成文件…</span>
-                  </div>
-                  <McpToolCallCard
-                    v-else-if="tc.isMcp"
-                    :toolName="tc.toolName"
-                    :displayName="getToolDisplayName(tc.toolName)"
-                    :langMode="toolLangMode"
-                    :args="tc.args"
-                    :result="tc.result"
-                    :cost="tc.cost"
-                  />
-                  <ToolCallCard
-                    v-else
-                    :toolName="tc.toolName"
-                    :displayName="getToolDisplayName(tc.toolName)"
-                    :langMode="toolLangMode"
-                    :args="tc.args"
-                    :result="tc.result"
-                    :cost="tc.cost"
-                  />
-                </template>
-              </template>
-
-              <!-- 流式阶段最后一个“正在思考”的 step（还未推入 msg.steps） -->
-              <template v-if="msg.role === 'assistant' && isRunning && idx === messages.length - 1">
-                <Think
-                  v-if="currentStep.reasoning"
-                  :thinkchunk="currentStep.reasoning"
-                  :thinking="true"
-                  :thinking-time="currentStep.thinkingTime"
-                  label="Thought"
-                />
-                <template v-for="(tc, ti) in (currentStep.tools || [])" :key="'stream-tc-' + ti">
-                  <div v-if="isFileTool(tc.toolName) && getParsedFiles(tc).length" class="generated-files-block">
-                    <GeneratedFileCard
-                      v-for="(file, fi) in getParsedFiles(tc)"
-                      :key="fi"
-                      :fileName="file.fileName"
-                      :fileType="file.fileType"
-                      :url="file.url"
-                      :contentBase64="file.contentBase64"
-                      :mimeType="file.mimeType"
-                      :size="file.size"
-                    />
-                  </div>
-                  <div v-else-if="isFileTool(tc.toolName) && !tc.result" class="file-tool-loading">
-                    <span class="file-tool-loading-icon">⏳</span>
-                    <span>正在生成文件…</span>
-                  </div>
-                  <McpToolCallCard
-                    v-else-if="tc.isMcp"
-                    :toolName="tc.toolName"
-                    :displayName="getToolDisplayName(tc.toolName)"
-                    :langMode="toolLangMode"
-                    :args="tc.args"
-                    :result="tc.result"
-                    :cost="tc.cost"
-                  />
-                  <ToolCallCard
-                    v-else
-                    :toolName="tc.toolName"
-                    :displayName="getToolDisplayName(tc.toolName)"
-                    :langMode="toolLangMode"
-                    :args="tc.args"
-                    :result="tc.result"
-                    :cost="tc.cost"
-                  />
-                </template>
-              </template>
+              <div
+                v-if="(msg.steps?.length || 0) > 0 || (isRunning && idx === messages.length - 1)"
+                class="agent-run"
+              >
+                <button
+                  type="button"
+                  class="agent-run-toggle"
+                  :aria-expanded="!!msg.thinkingExpanded"
+                  @click="msg.thinkingExpanded = !msg.thinkingExpanded"
+                >
+                  <span class="agent-run-title">思考过程</span>
+                  <span class="agent-run-duration">{{ getRunDurationLabel(msg, idx) }}</span>
+                  <svg class="agent-run-chevron" :class="{ expanded: msg.thinkingExpanded }" width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+                    <path d="m4 6 4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                </button>
+                <div v-show="msg.thinkingExpanded" class="agent-run-details">
+                  <template v-for="(step, si) in (msg.steps || [])" :key="'step-' + si">
+                    <Think v-if="step.reasoning" :thinkchunk="step.reasoning" :thinking="false" :thinking-time="step.thinkingTime" label="思考" minimal />
+                    <div v-if="step.content" class="message-content assistant-body agent-step-text" v-html="renderStepText(step.content)"></div>
+                    <template v-for="(tc, ti) in (step.tools || [])" :key="'tc-' + si + '-' + ti">
+                      <ToolCallCard :toolName="tc.toolName" :displayName="getToolDisplayName(tc.toolName)" :langMode="toolLangMode" :args="tc.args" :result="tc.result" :cost="tc.cost" :isMcp="tc.isMcp" />
+                      <div v-if="isFileTool(tc.toolName) && getParsedFiles(tc).length" class="generated-files-block">
+                        <GeneratedFileCard v-for="(file, fi) in getParsedFiles(tc)" :key="fi" :fileName="file.fileName" :fileType="file.fileType" :url="file.url" :contentBase64="file.contentBase64" :mimeType="file.mimeType" :size="file.size" />
+                      </div>
+                    </template>
+                  </template>
+                  <template v-if="isRunning && idx === messages.length - 1">
+                    <Think v-if="currentStep.reasoning" :thinkchunk="currentStep.reasoning" :thinking="true" :thinking-time="currentStep.thinkingTime" label="思考" minimal />
+                    <div v-if="currentStep.content" class="message-content assistant-body agent-step-text" v-html="renderStepText(currentStep.content)"></div>
+                    <template v-for="(tc, ti) in (currentStep.tools || [])" :key="'stream-tc-' + ti">
+                      <ToolCallCard :toolName="tc.toolName" :displayName="getToolDisplayName(tc.toolName)" :langMode="toolLangMode" :args="tc.args" :result="tc.result" :cost="tc.cost" :isMcp="tc.isMcp" />
+                      <div v-if="isFileTool(tc.toolName) && getParsedFiles(tc).length" class="generated-files-block">
+                        <GeneratedFileCard v-for="(file, fi) in getParsedFiles(tc)" :key="fi" :fileName="file.fileName" :fileType="file.fileType" :url="file.url" :contentBase64="file.contentBase64" :mimeType="file.mimeType" :size="file.size" />
+                      </div>
+                    </template>
+                  </template>
+                </div>
+              </div>
 
               <div v-if="msg.attachmentLoading" class="attachment-loading">
                 <span class="attachment-loading-text">正在读取附件...</span>
@@ -139,7 +85,7 @@
               <div class="message-content assistant-body" v-html="getAssistantMessageHtml(msg, idx)"></div>
               <!-- 消息统计 footer：展示 Token 使用与耗时等信息 -->
               <div
-                v-if="msg.role === 'assistant' && (msg.tokens != null || msg.promptTokens != null || msg.completionTokens != null || msg.cachedTokens != null || (msg.cost != null && msg.cost > 0))"
+                v-if="msg.role === 'assistant' && (msg.tokens != null || msg.promptTokens != null || msg.completionTokens != null || msg.cachedTokens != null)"
                 class="agent-message-footer"
               >
                 <span v-if="msg.tokens != null">
@@ -154,9 +100,6 @@
                   v-if="msg.promptTokens != null || msg.completionTokens != null || msg.cachedTokens != null"
                 >
                   （提示 {{ msg.promptTokens ?? 0 }} · 输出 {{ msg.completionTokens ?? 0 }}<span v-if="msg.cachedTokens != null"> · 缓存 {{ msg.cachedTokens }}</span>）
-                </span>
-                <span v-if="msg.cost != null && msg.cost > 0">
-                  · 总耗时：{{ Math.round(msg.cost / 1000) }}s
                 </span>
               </div>
             </div>
@@ -438,7 +381,6 @@ import { uploadFile } from '../api/upload'
 import { compressMediaAttachment, isAllowedVideoFormat } from '../utils/attachment-compress'
 import Think from '../components/Think.vue'
 import ToolCallCard from '../components/ToolCallCard.vue'
-import McpToolCallCard from '../components/McpToolCallCard.vue'
 import GeneratedFileCard from '../components/GeneratedFileCard.vue'
 import AgentHome from '../components/AgentHome.vue'
 import NotificationCenter from '../components/NotificationCenter.vue'
@@ -485,6 +427,7 @@ interface ParsedFileItem {
 // 单个推理阶段（step）：包含一段推理文本及该阶段内的工具调用
 interface MessageStep {
   reasoning?: string          // 该阶段的推理文本
+  content?: string            // 后面仍有步骤或工具调用的阶段性文本
   thinkingTime?: number       // 该阶段推理耗时(ms)
   tools?: ToolCallItem[]      // 该阶段的工具调用列表
 }
@@ -525,6 +468,9 @@ interface Message {
   thinkingExpanded?: boolean
   /** 整体推理耗时（毫秒），用于在推理卡片头部展示 */
   thinkingTime?: number
+  /** 本次运行的本地开始时间和最终耗时（历史记录优先使用后端 cost） */
+  runStartedAt?: number
+  runDuration?: number
   /** usage 统计字段：提示/补全/缓存 token */
   promptTokens?: number
   completionTokens?: number
@@ -826,7 +772,6 @@ const currentMessage = reactive<Message>({
   content: '',
   steps: [],
   attachmentLoading: false,
-  thinkingExpanded: false
 })
 /** 当前流式推理阶段（暂存，step_start/done 时推入当前消息的 steps 中） */
 const currentStep = reactive<MessageStep>({
@@ -882,6 +827,18 @@ const hasUnconfirmedAgentAttachments = computed(() =>
   agentAttachments.value.some((a) => a.status === 'uploading')
 )
 const isRunning = ref(false)
+const runNow = ref(Date.now())
+let runClock: ReturnType<typeof setInterval> | null = null
+
+function getRunDurationLabel(msg: Message, idx: number): string {
+  const live = isRunning.value && idx === messages.value.length - 1 && msg.runStartedAt != null
+  const elapsed = live ? runNow.value - msg.runStartedAt! : (msg.cost ?? msg.runDuration ?? msg.thinkingTime ?? (msg.steps || []).reduce((sum, step) => sum + (step.thinkingTime || 0), 0))
+  if (!Number.isFinite(elapsed) || elapsed <= 0) return live ? '进行中' : ''
+  const seconds = Math.max(1, Math.floor(elapsed / 1000))
+  const minutes = Math.floor(seconds / 60)
+  const time = minutes ? `${minutes}m ${seconds % 60}s` : `${seconds}s`
+  return live ? `进行中 · ${time}` : `用时 ${time}`
+}
 const errorMessage = ref('')
 const warnMessage = ref('')
 const messagesLoading = ref(false)
@@ -1251,6 +1208,10 @@ function getAssistantMessageHtml(msg: Message, index: number): string {
   return marked(text, { breaks: true }) as string
 }
 
+function renderStepText(content: string): string {
+  return marked(content, { breaks: true }) as string
+}
+
 // JSON 格式化
 function formatJson(obj: any): string {
   try {
@@ -1416,7 +1377,6 @@ async function handleSend() {
   currentMessage.content = ''
   currentMessage.thinkingTime = undefined
   currentMessage.attachmentLoading = false
-  currentMessage.thinkingExpanded = false
   currentMessage.steps = []
   currentStep.reasoning = ''
   currentStep.tools = []
@@ -1436,9 +1396,7 @@ async function handleSend() {
         lastMessage: text,
         updateTime: Date.now()
       })
-      void createSession(text, currentSessionId).catch((e) => {
-        console.error('后台创建会话失败:', e)
-      })
+      await createSession(text, currentSessionId)
     } else if (pendingNewSessionId.value) {
       // 从首页「开始智能体」进来的待创建会话：首条消息时创建会话并加入列表
       const sid = currentSessionId
@@ -1448,12 +1406,10 @@ async function handleSend() {
         lastMessage: text,
         updateTime: Date.now()
       })
-      void createSession(text, sid).catch((e) => {
-        console.error('后台创建会话失败:', e)
-      })
+      await createSession(text, sid)
       pendingNewSessionId.value = null
     }
-    // 在后台并行异步创建会话，不阻塞 /run
+    // 确认会话已创建，再提交 /run；后端会校验会话所有权
     // POST + SSE 流，请求体为 AgentSendReq，已登录时请求头携带 Authorization
     const url = '/api/agent/run'
     const token = getToken()
@@ -1498,14 +1454,19 @@ async function handleSend() {
       content: '',
       steps: [],
       attachmentLoading: false,
-      thinkingExpanded: false,
-      thinkingTime: undefined
+      thinkingExpanded: true,
+      thinkingTime: undefined,
+      runStartedAt: Date.now()
     })
+    runNow.value = Date.now()
+    if (runClock) clearInterval(runClock)
+    runClock = setInterval(() => { runNow.value = Date.now() }, 1000)
     // 辅助函数：将当前 step 推入当前消息的 steps 列表（用于 step_start / done）
     const pushCurrentStepIfNeeded = () => {
       const hasReasoning = !!(currentStep.reasoning && currentStep.reasoning.trim())
+      const hasContent = !!(currentStep.content && currentStep.content.trim())
       const hasTools = !!(currentStep.tools && currentStep.tools.length)
-      if (!hasReasoning && !hasTools) {
+      if (!hasReasoning && !hasContent && !hasTools) {
         currentStepStartedAt = undefined
         return
       }
@@ -1518,6 +1479,7 @@ async function handleSend() {
           : currentStep.thinkingTime
       const step: MessageStep = {
         reasoning: currentStep.reasoning,
+        content: currentStep.content,
         thinkingTime: stepTime,
         tools: currentStep.tools ? [...currentStep.tools] : []
       }
@@ -1525,9 +1487,16 @@ async function handleSend() {
       currentMessage.steps.push(step)
       // 重置临时 step
       currentStep.reasoning = ''
+      currentStep.content = ''
       currentStep.tools = []
       currentStep.thinkingTime = undefined
       currentStepStartedAt = undefined
+    }
+
+    const movePendingTextToStep = () => {
+      if (!currentMessage.content) return
+      currentStep.content = (currentStep.content || '') + currentMessage.content
+      currentMessage.content = ''
     }
 
     const updateLastAssistantFromCurrent = () => {
@@ -1542,6 +1511,7 @@ async function handleSend() {
       }
     }
 
+    let terminalEventReceived = false
     const dispatch = (event: string, data: string) => {
       switch (event) {
         case 'attachment_loading': {
@@ -1592,6 +1562,7 @@ async function handleSend() {
         case 'step_start': {
           // 阶段切换：将当前 step 推入 steps，后续 reasoning / 工具归入新的 step
           currentMessage.attachmentLoading = false
+          movePendingTextToStep()
           pushCurrentStepIfNeeded()
           updateLastAssistantFromCurrent()
           scrollToBottom()
@@ -1607,6 +1578,7 @@ async function handleSend() {
             const isMcp = event === 'mcp_call' || isMcpToolName(toolName)
             if (!currentStep.tools) currentStep.tools = []
             currentMessage.attachmentLoading = false
+            movePendingTextToStep()
             currentStep.tools.push({ toolCallId, toolName, args, result: null, isMcp })
             updateLastAssistantFromCurrent()
           } catch (e) {
@@ -1648,6 +1620,7 @@ async function handleSend() {
           setTimeout(() => (warnMessage.value = ''), 5000)
           break
         case 'error':
+          terminalEventReceived = true
           currentMessage.attachmentLoading = false
           errorMessage.value = data || '发生错误'
           closeEventSource()
@@ -1659,6 +1632,7 @@ async function handleSend() {
           }
           break
         case 'done': {
+          terminalEventReceived = true
           // 解析 usage 统计数据（thinkingTime / promptTokens / completionTokens / cachedTokens / cost / tokens）
           let stats: any = null
           if (data) {
@@ -1680,7 +1654,6 @@ async function handleSend() {
 
             // 将当前未结束的 step 推入 steps
             pushCurrentStepIfNeeded()
-            currentMessage.content = currentMessage.content
             lastMsg.content = currentMessage.content
             lastMsg.attachmentLoading = false
             lastMsg.steps = currentMessage.steps ? [...currentMessage.steps] : []
@@ -1694,6 +1667,7 @@ async function handleSend() {
           currentMessage.attachmentLoading = false
           currentMessage.steps = []
           currentStep.reasoning = ''
+          currentStep.content = ''
           currentStep.tools = []
           currentStep.thinkingTime = undefined
           currentStepStartedAt = undefined
@@ -1702,6 +1676,11 @@ async function handleSend() {
           window.dispatchEvent(new CustomEvent('agent-sessions:updated'))
           break
         }
+        case 'cancelled':
+          terminalEventReceived = true
+          warnMessage.value = '任务已取消'
+          closeEventSource()
+          break
       }
     }
 
@@ -1736,19 +1715,20 @@ async function handleSend() {
       if (eventType && dataLines.length) {
         dispatch(eventType, dataLines.join('\n').trim())
       }
-      if (isRunning.value) {
+      if (isRunning.value && !terminalEventReceived) {
+        errorMessage.value = '连接中断，任务状态尚未确认'
         closeEventSource()
       }
     } catch (e) {
       if ((e as Error).name !== 'AbortError' && isRunning.value) {
-        errorMessage.value = '连接中断'
+        errorMessage.value = '连接中断，任务状态尚未确认'
       }
       closeEventSource()
     }
 
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '发送失败'
-    isRunning.value = false
+    closeEventSource()
   }
 }
 
@@ -1767,17 +1747,16 @@ onMounted(() => {
 // 停止运行
 async function handleStop() {
   if (!currentSessionId) return
-
-  // 先本地停止流式连接，按钮立刻从“停止”恢复为“发送”
-  closeEventSource()
-
   try {
-    await apiFetch(`/api/agent/cancel?sessionId=${currentSessionId}`, {
+    const response = await apiFetch(`/api/agent/cancel?sessionId=${encodeURIComponent(currentSessionId)}`, {
       method: 'POST',
       credentials: 'include'
     })
+    if (!response.ok) throw new Error('取消任务失败')
+    warnMessage.value = '正在取消任务'
   } catch (error) {
     console.error('取消失败:', error)
+    errorMessage.value = '取消任务失败，请重试'
   }
 }
 
@@ -1785,6 +1764,13 @@ async function handleStop() {
 function closeEventSource() {
   currentMessage.attachmentLoading = false
   const last = messages.value[messages.value.length - 1]
+  if (last?.role === 'assistant' && last.runStartedAt != null && last.runDuration == null) {
+    last.runDuration = Math.max(0, Date.now() - last.runStartedAt)
+  }
+  if (runClock) {
+    clearInterval(runClock)
+    runClock = null
+  }
   if (last?.role === 'assistant' && last.attachmentLoading) {
     last.attachmentLoading = false
   }
@@ -1834,14 +1820,23 @@ async function loadMessages(sessionId: string) {
       const pushCurrentStepHistory = () => {
         if (!currentStepForHistory) return
         const hasReasoning = !!(currentStepForHistory.reasoning && currentStepForHistory.reasoning.trim())
+        const hasContent = !!(currentStepForHistory.content && currentStepForHistory.content.trim())
         const hasTools = !!(currentStepForHistory.tools && currentStepForHistory.tools.length)
-        if (!hasReasoning && !hasTools) return
+        if (!hasReasoning && !hasContent && !hasTools) return
         currentSteps.push({
           reasoning: currentStepForHistory.reasoning,
+          content: currentStepForHistory.content,
           thinkingTime: currentStepForHistory.thinkingTime,
           tools: currentStepForHistory.tools ? [...currentStepForHistory.tools] : []
         })
         currentStepForHistory = null
+      }
+
+      const moveHistoryTextToStep = () => {
+        if (!currentAssistant?.content) return
+        if (!currentStepForHistory) currentStepForHistory = { tools: [] }
+        currentStepForHistory.content = (currentStepForHistory.content || '') + currentAssistant.content
+        currentAssistant.content = ''
       }
 
       const finishCurrentAssistant = () => {
@@ -1864,7 +1859,6 @@ async function loadMessages(sessionId: string) {
           history.push({
             role: 'user',
             content: payload.content || '',
-            thinkingExpanded: false
           })
           continue
         }
@@ -1878,12 +1872,12 @@ async function loadMessages(sessionId: string) {
             currentAssistant = {
               role: 'assistant',
               content: '',
-              thinkingExpanded: false
             }
             currentSteps = []
             currentStepForHistory = null
           } else {
             // 之前的 step 收尾，开启新 step
+            moveHistoryTextToStep()
             pushCurrentStepHistory()
           }
 
@@ -1914,6 +1908,7 @@ async function loadMessages(sessionId: string) {
             currentStepForHistory = { tools: [] }
           }
           if (!currentStepForHistory.tools) currentStepForHistory.tools = []
+          moveHistoryTextToStep()
           const toolName = payload.toolName || (payload.meta?.toolName as string) || 'unknown'
           const isMcp = type === 'mcp_call' || isMcpToolName(toolName)
           currentStepForHistory.tools.push({
@@ -2858,89 +2853,26 @@ onBeforeUnmount(() => {
   height: 18px;
 }
 
-.message-bubble.assistant :deep(.think-card) {
-  border: 1px solid var(--agent-border);
-  background: linear-gradient(180deg, #ffffff 0%, #f5f8fc 100%);
-}
-
 .message-bubble.assistant :deep(.think-label) {
   color: var(--agent-text-muted);
 }
 
-.message-bubble.assistant :deep(.tool-card) {
-  border-color: #b8c9dc;
-  background: #f6faff;
-  box-shadow: 0 8px 20px rgba(28, 44, 66, 0.12);
-  max-width: min(98%, 1060px);
-}
-
-.message-bubble.assistant :deep(.tool-card .card-header) {
-  background: #e2ebf8;
-  border-bottom-color: #c8d5e6;
-}
-
-.message-bubble.assistant :deep(.tool-card .tool-name),
-.message-bubble.assistant :deep(.tool-card .param-val),
-.message-bubble.assistant :deep(.tool-card .result-block) {
-  color: #1f2d3d;
-}
-
-.message-bubble.assistant :deep(.tool-card .param-key),
-.message-bubble.assistant :deep(.tool-card .section-label),
-.message-bubble.assistant :deep(.tool-card .footer-meta) {
-  color: #5b6b7f;
-}
-
-.message-bubble.assistant :deep(.tool-card .status-badge.success) {
-  background: rgba(15, 118, 110, 0.12);
-  border-color: rgba(15, 118, 110, 0.24);
-  color: #0f766e;
-}
-
-.message-bubble.assistant :deep(.tool-card .status-badge.error) {
-  background: rgba(239, 68, 68, 0.12);
-  border-color: rgba(239, 68, 68, 0.28);
-  color: #b91c1c;
-}
-
-.message-bubble.assistant :deep(.tool-card .status-badge.running) {
-  background: rgba(59, 130, 246, 0.12);
-  border-color: rgba(59, 130, 246, 0.28);
-  color: #1d4ed8;
-}
-
-.message-bubble.assistant :deep(.tool-card .result-block) {
-  background: #ffffff;
-  border-color: #cfdceb;
-}
-
-.message-bubble.assistant :deep(.mcp-card) {
-  border-color: #bfcddd;
-  background: #fbfdff;
-  box-shadow: 0 8px 20px rgba(28, 44, 66, 0.12);
-}
-
-.message-bubble.assistant :deep(.mcp-card .card-header) {
-  background: #e7eef7;
-  border-bottom-color: #cdd9e8;
-}
-
-.message-bubble.assistant :deep(.mcp-card .mcp-title),
-.message-bubble.assistant :deep(.mcp-card .param-val),
-.message-bubble.assistant :deep(.mcp-card .result-block) {
-  color: #1f2d3d;
-}
-
-.message-bubble.assistant :deep(.mcp-card .section-label),
-.message-bubble.assistant :deep(.mcp-card .param-key),
-.message-bubble.assistant :deep(.mcp-card .cost-text) {
-  color: #5b6b7f;
-}
-
-.message-bubble.assistant :deep(.mcp-card .result-block) {
-  background: #f7fbff;
-  border-color: #d6e2ef;
-}
+.agent-run { width: min(98%, 1100px); max-width: 100%; margin-bottom: 10px; }
+.agent-run-toggle { display: inline-flex; align-items: center; gap: 9px; min-height: 32px; padding: 3px 6px; border: 0; border-radius: 6px; background: transparent; color: #7c8592; font: inherit; font-size: 13px; cursor: pointer; }
+.agent-run-toggle:hover { background: rgba(105, 125, 150, .07); color: #424b58; }
+.agent-run-toggle:focus-visible { outline: 2px solid #7e9ac2; outline-offset: 2px; }
+.agent-run-title { color: #535d6b; font-weight: 500; }
+.agent-run-duration { color: #929aa5; font-size: 12px; }
+.agent-run-chevron { width: 15px; height: 15px; color: #9aa2ad; transition: transform .18s ease; }
+.agent-run-chevron.expanded { transform: rotate(180deg); }
+.agent-run-details { margin-top: 4px; padding: 7px 0 0 9px; border-top: 1px solid #e8eaee; }
+.agent-run-details :deep(.think-card) { margin: 0 0 3px; }
+.agent-run-details .agent-step-text { width: 100%; margin: 3px 0 9px; padding: 0 6px; color: #626b78; font-size: 14px; line-height: 1.75; }
+:global(.dark) .agent-run-details .agent-step-text { color: #a9b4c3; }
+:global(.dark) .agent-run-toggle { color: #a6afba; }
+:global(.dark) .agent-run-title { color: #c0c8d3; }
+:global(.dark) .agent-run-duration { color: #8994a3; }
+:global(.dark) .agent-run-details { border-top-color: #354052; }
 
 .send-button:disabled {
   opacity: 0.5;
@@ -3204,7 +3136,7 @@ onBeforeUnmount(() => {
     max-width: 85%;
   }
   .message-content.assistant-body,
-  .message-bubble.assistant :deep(.tool-card) {
+  .message-bubble.assistant :deep(.runtime-tool) {
     width: 100%;
     max-width: 100%;
   }
