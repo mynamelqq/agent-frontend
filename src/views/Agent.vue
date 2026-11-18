@@ -21,15 +21,24 @@
       <!-- 左侧：首页 或 对话区 -->
       <div class="agent-left">
         <!-- 智能体首页（无 sessionId 时展示） -->
-        <div v-if="showHome" class="agent-home-wrap">
-            <AgentHome @start="handleStartConversation" />
-        </div>
         <!-- 对话区（有 sessionId 时展示） -->
-        <template v-else>
-          <div class="agent-chat">
-        <div class="messages-container" ref="messagesContainer" @scroll="handleMessagesScroll">
-          <div v-for="(msg, idx) in messages" :key="idx" class="message-group" :class="msg.role">
+          <div class="agent-chat" :class="{ 'agent-chat-home': showHome }">
+        <AgentHome v-if="showHome" />
+        <div v-show="!showHome" class="messages-container" ref="messagesContainer" @scroll="handleMessagesScroll">
+          <div v-for="(msg, idx) in messages" :key="msg.id || `${msg.runId || 'legacy'}-${idx}`" class="message-group" :class="msg.role">
             <!-- 用户消息 -->
+            <div v-if="msg.role === 'user' && msg.attachments?.length" class="agent-message-attachments">
+              <template v-for="attachment in msg.attachments" :key="attachment.id">
+                <button v-if="attachment.fileUrl && attachment.fileType?.startsWith('image/')" type="button" class="agent-message-attachment" @click="openAgentImagePreview(attachment.fileUrl, attachment.fileName)">
+                  <img :src="attachment.fileUrl" :alt="attachment.fileName" class="agent-message-attachment-image" />
+                  <span :title="attachment.fileName">{{ attachment.fileName || '图片' }}</span>
+                </button>
+                <a v-else-if="attachment.fileUrl" class="agent-message-attachment" :href="attachment.fileUrl" target="_blank" rel="noopener">
+                  <span class="agent-message-file-icon" aria-hidden="true"><svg viewBox="0 0 32 32" fill="none"><path d="M8 3.5h10l7 7v17a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2v-22a2 2 0 0 1 2-2Z" fill="currentColor" opacity=".14"/><path d="M18 3.5v6a2 2 0 0 0 2 2h5M8 3.5h10l7 7v17a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2v-22a2 2 0 0 1 2-2Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M11 18h10M11 22h7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></span><span :title="attachment.fileName">{{ attachment.fileName || '附件' }}</span>
+                </a>
+                <span v-else class="agent-message-attachment"><span class="agent-message-file-icon" aria-hidden="true"><svg viewBox="0 0 32 32" fill="none"><path d="M8 3.5h10l7 7v17a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2v-22a2 2 0 0 1 2-2Z" fill="currentColor" opacity=".14"/><path d="M18 3.5v6a2 2 0 0 0 2 2h5M8 3.5h10l7 7v17a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2v-22a2 2 0 0 1 2-2Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M11 18h10M11 22h7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></span><span :title="attachment.fileName">{{ attachment.fileName || '附件' }}</span></span>
+              </template>
+            </div>
             <div v-if="msg.role === 'user'" class="message-bubble user">
               <div class="message-content">{{ msg.content }}</div>
             </div>
@@ -43,6 +52,7 @@
                 <button
                   type="button"
                   class="agent-run-toggle"
+                  :class="{ 'is-running': isRunning && idx === messages.length - 1 }"
                   :aria-expanded="!!msg.thinkingExpanded"
                   @click="msg.thinkingExpanded = !msg.thinkingExpanded"
                 >
@@ -57,7 +67,7 @@
                     <Think v-if="step.reasoning" :thinkchunk="step.reasoning" :thinking="false" :thinking-time="step.thinkingTime" label="思考" minimal />
                     <div v-if="step.content" class="message-content assistant-body agent-step-text" v-html="renderStepText(step.content)"></div>
                     <template v-for="(tc, ti) in (step.tools || [])" :key="'tc-' + si + '-' + ti">
-                      <ToolCallCard :toolName="tc.toolName" :displayName="getToolDisplayName(tc.toolName)" :langMode="toolLangMode" :args="tc.args" :result="tc.result" :cost="tc.cost" :isMcp="tc.isMcp" />
+                      <ToolCallCard :toolName="tc.toolName" :displayName="getToolDisplayName(tc.toolName)" :langMode="toolLangMode" :args="tc.args" :result="tc.result" :displayResult="tc.displayResult" :displayFormat="tc.displayFormat" :language="tc.language" :cost="tc.cost" :isMcp="tc.isMcp" />
                       <div v-if="isFileTool(tc.toolName) && getParsedFiles(tc).length" class="generated-files-block">
                         <GeneratedFileCard v-for="(file, fi) in getParsedFiles(tc)" :key="fi" :fileName="file.fileName" :fileType="file.fileType" :url="file.url" :contentBase64="file.contentBase64" :mimeType="file.mimeType" :size="file.size" />
                       </div>
@@ -67,7 +77,7 @@
                     <Think v-if="currentStep.reasoning" :thinkchunk="currentStep.reasoning" :thinking="true" :thinking-time="currentStep.thinkingTime" label="思考" minimal />
                     <div v-if="currentStep.content" class="message-content assistant-body agent-step-text" v-html="renderStepText(currentStep.content)"></div>
                     <template v-for="(tc, ti) in (currentStep.tools || [])" :key="'stream-tc-' + ti">
-                      <ToolCallCard :toolName="tc.toolName" :displayName="getToolDisplayName(tc.toolName)" :langMode="toolLangMode" :args="tc.args" :result="tc.result" :cost="tc.cost" :isMcp="tc.isMcp" />
+                      <ToolCallCard :toolName="tc.toolName" :displayName="getToolDisplayName(tc.toolName)" :langMode="toolLangMode" :args="tc.args" :result="tc.result" :displayResult="tc.displayResult" :displayFormat="tc.displayFormat" :language="tc.language" :cost="tc.cost" :isMcp="tc.isMcp" />
                       <div v-if="isFileTool(tc.toolName) && getParsedFiles(tc).length" class="generated-files-block">
                         <GeneratedFileCard v-for="(file, fi) in getParsedFiles(tc)" :key="fi" :fileName="file.fileName" :fileType="file.fileType" :url="file.url" :contentBase64="file.contentBase64" :mimeType="file.mimeType" :size="file.size" />
                       </div>
@@ -82,25 +92,24 @@
               </div>
 
               <!-- 正文内容（流式时用 markdown 流式渲染） -->
-              <div class="message-content assistant-body" v-html="getAssistantMessageHtml(msg, idx)"></div>
-              <!-- 消息统计 footer：展示 Token 使用与耗时等信息 -->
-              <div
-                v-if="msg.role === 'assistant' && (msg.tokens != null || msg.promptTokens != null || msg.completionTokens != null || msg.cachedTokens != null)"
-                class="agent-message-footer"
-              >
-                <span v-if="msg.tokens != null">
-                  Token：{{ msg.tokens }}
-                </span>
-                <span
-                  v-else-if="msg.promptTokens != null || msg.completionTokens != null || msg.cachedTokens != null"
-                >
-                  Token：{{ (msg.promptTokens || 0) + (msg.completionTokens || 0) + (msg.cachedTokens || 0) }}
-                </span>
-                <span
-                  v-if="msg.promptTokens != null || msg.completionTokens != null || msg.cachedTokens != null"
-                >
-                  （提示 {{ msg.promptTokens ?? 0 }} · 输出 {{ msg.completionTokens ?? 0 }}<span v-if="msg.cachedTokens != null"> · 缓存 {{ msg.cachedTokens }}</span>）
-                </span>
+              <div class="message-content assistant-body" v-html="getAssistantMessageHtml(msg)"></div>
+              <div v-if="msg.content && (!isRunning || idx !== messages.length - 1)" class="agent-message-actions">
+                <div class="agent-message-toolbar">
+                  <button type="button" class="agent-message-action" :title="copiedMessage === msg ? '已复制' : '复制正文'" :aria-label="copiedMessage === msg ? '已复制' : '复制正文'" :disabled="!msg.content" @click="copyAssistantMessage(msg)">
+                    <svg v-if="copiedMessage === msg" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6" /></svg>
+                    <svg v-else viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2" /><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" /></svg>
+                  </button>
+                  <button v-if="hasMessageDetails(msg)" type="button" class="agent-message-action" title="详细情况" aria-label="详细情况" :aria-expanded="!!msg.detailsExpanded" @click="msg.detailsExpanded = !msg.detailsExpanded">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /></svg>
+                  </button>
+                </div>
+                <div v-if="msg.detailsExpanded && hasMessageDetails(msg)" class="agent-message-details">
+                  <div v-if="msg.tokens != null || msg.promptTokens != null || msg.completionTokens != null || msg.cachedTokens != null"><span>总 Token</span><strong>{{ msg.tokens ?? ((msg.promptTokens ?? 0) + (msg.completionTokens ?? 0) + (msg.cachedTokens ?? 0)) }}</strong></div>
+                  <div v-if="msg.promptTokens != null"><span>提示 Token</span><strong>{{ msg.promptTokens }}</strong></div>
+                  <div v-if="msg.completionTokens != null"><span>输出 Token</span><strong>{{ msg.completionTokens }}</strong></div>
+                  <div v-if="msg.cachedTokens != null"><span>缓存 Token</span><strong>{{ msg.cachedTokens }}</strong></div>
+                  <div v-if="getRunDurationLabel(msg, idx)"><span>耗时</span><strong>{{ getRunDurationLabel(msg, idx).replace(/^用时 /, '') }}</strong></div>
+                </div>
               </div>
             </div>
           </div>
@@ -114,19 +123,15 @@
             </div>
             <span class="messages-loading-text">正在加载会话内容...</span>
           </div>
-          <!-- 运行中加载状态：仅在没有收到任何推理/正文时显示 -->
+          <!-- 响应建立前与运行中使用相同的“思考过程”提示 -->
           <div
-            v-else-if="isRunning
-              && !currentMessage.content
-              && !currentMessage.attachmentLoading
-              && !(currentMessage.steps && currentMessage.steps.length)
-              && !currentStep.reasoning
-              && !(currentStep.tools && currentStep.tools.length)"
-            class="loading-dots"
+            v-else-if="isRunning && messages[messages.length - 1]?.role !== 'assistant'"
+            class="agent-run agent-run-pending"
+            role="status"
           >
-            <div class="loading-dot"></div>
-            <div class="loading-dot"></div>
-            <div class="loading-dot"></div>
+            <div class="agent-run-toggle is-running">
+              <span class="agent-run-title">思考过程</span>
+            </div>
           </div>
         </div>
 
@@ -219,11 +224,12 @@
             :class="{ 'input-box-has-attachments': agentAttachments.length > 0 }"
             :style="{ '--input-max-height': `${INPUT_MAX_HEIGHT_PX}px` }"
           >
+            <button class="composer-add" title="添加附件" aria-label="添加附件" type="button" :disabled="isRunning || agentIsUploading" @click="triggerAgentFileSelect">＋</button>
             <textarea
               ref="messageInputRef"
               v-model="userInput"
               class="message-input"
-              placeholder="输入你的问题...（也可点击麦克风语音输入）"
+              placeholder="向智能体提问"
               :disabled="isRunning"
               @input="scheduleAutoResizeMessageInput"
               @compositionend="scheduleAutoResizeMessageInput"
@@ -233,7 +239,7 @@
             <!-- 右侧操作区：附件按钮 + 发送/停止 -->
             <div class="input-trailing">
               <button
-                class="input-action-btn"
+                class="input-action-btn legacy-attach-button"
                 title="添加附件"
                 type="button"
                 :disabled="isRunning || agentIsUploading"
@@ -303,13 +309,12 @@
                 :disabled="!userInput.trim() || hasUnconfirmedAgentAttachments"
                 @click="handleSend"
               >
-                ➤
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6" /></svg>
               </button>
             </div>
           </div>
         </div>
       </div>
-        </template>
       </div>
     </div>
 
@@ -330,19 +335,21 @@
           </div>
           <div class="dictation-bubble-actions">
             <button
+                v-if="dictationTranscript && !dictationError"
               type="button"
               class="dictation-bubble-btn dictation-bubble-btn-primary"
               :disabled="!dictationTranscript"
               @click="submitDictationToInput"
             >
-              ✅
+                使用文字
             </button>
             <button
               type="button"
               class="dictation-bubble-btn"
               @click="cancelDictation"
+                aria-label="关闭语音提示"
             >
-              ❌
+                ×
             </button>
           </div>
         </div>
@@ -373,7 +380,6 @@
 <script setup lang="ts">
 import { ref, reactive, nextTick, computed, watch, onBeforeUnmount, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { marked } from 'marked'
 import { isLoggedIn, getToken } from '../stores/auth'
 import { apiFetch, apiFetchRaw } from '../api/http'
 import { buildWsUrl } from '../api/base-url'
@@ -408,6 +414,9 @@ interface ToolCallItem {
   toolName: string
   args: string
   result: string | null
+  displayResult?: string
+  displayFormat?: string
+  language?: string
   isMcp?: boolean
   /** 单次工具执行耗时（毫秒），由 tool_result.cost 提供 */
   cost?: number
@@ -440,6 +449,10 @@ interface AgentMessagePayload {
   toolName?: string
   toolArgs?: string
   toolResult?: string
+  displayResult?: string
+  displayFormat?: string
+  language?: string
+  toolSuccess?: boolean
   /** 单次工具执行耗时（毫秒） */
   cost?: number
   thinkingTime?: number
@@ -459,13 +472,17 @@ interface AgentMessagePayload {
 
 // 类型定义
 interface Message {
+  id?: string
+  runId?: string | null
   role: 'user' | 'assistant'
   content: string
+  attachments?: AgentAttachmentVO[]
   /** 本条助手消息的推理阶段(step) 列表 */
   steps?: MessageStep[]
   /** 当前助手消息是否处于附件读取阶段 */
   attachmentLoading?: boolean
   thinkingExpanded?: boolean
+  detailsExpanded?: boolean
   /** 整体推理耗时（毫秒），用于在推理卡片头部展示 */
   thinkingTime?: number
   /** 本次运行的本地开始时间和最终耗时（历史记录优先使用后端 cost） */
@@ -478,6 +495,19 @@ interface Message {
   /** usage 统计字段：总耗时（毫秒）与总 token 数 */
   cost?: number
   tokens?: number
+}
+
+interface AgentAttachmentVO {
+  id: string
+  fileName: string
+  fileUrl: string
+  fileSize?: number
+  fileType?: string
+}
+
+interface AgentMessagesVO {
+  messages: any[]
+  attachmentsByRunId?: Record<string, AgentAttachmentVO[]>
 }
 
 interface UsageStats {
@@ -493,6 +523,9 @@ interface AgentToolEventPayload {
   toolCallId?: string
   toolName?: string
   content?: string
+  displayResult?: string
+  displayFormat?: string
+  language?: string
   meta?: Record<string, unknown>
   cost?: number
 }
@@ -767,6 +800,23 @@ function goBack() {
 
 // 响应式数据
 const messages = ref<Message[]>([])
+const copiedMessage = ref<Message | null>(null)
+function hasMessageDetails(msg: Message): boolean {
+  return msg.tokens != null || msg.promptTokens != null || msg.completionTokens != null ||
+    msg.cachedTokens != null || msg.cost != null || msg.runDuration != null || msg.thinkingTime != null
+}
+async function copyAssistantMessage(msg: Message) {
+  if (!msg.content) return
+  try {
+    await navigator.clipboard.writeText(msg.content)
+    copiedMessage.value = msg
+    window.setTimeout(() => {
+      if (copiedMessage.value === msg) copiedMessage.value = null
+    }, 1500)
+  } catch {
+    warnMessage.value = '复制失败'
+  }
+}
 const currentMessage = reactive<Message>({
   role: 'assistant',
   content: '',
@@ -816,6 +866,17 @@ interface AgentAttachment {
   error?: string
 }
 const agentAttachments = ref<AgentAttachment[]>([])
+let draftRunId: string | null = null
+
+function createRunId(): string {
+  const words = new Uint32Array(2)
+  let value = 0n
+  do {
+    crypto.getRandomValues(words)
+    value = (BigInt(words[0] & 0x7fffffff) << 32n) | BigInt(words[1])
+  } while (value === 0n)
+  return value.toString()
+}
 const agentImagePreview = reactive({
   visible: false,
   src: '',
@@ -849,6 +910,9 @@ let runAbortController: AbortController | null = null
 let currentSessionId: string | null = null
 // 从首页「开始智能体」进入的待创建会话：首条消息发送时再调用 createSession 并加入列表，不在此前插入占位
 const pendingNewSessionId = ref<string | null>(null)
+let creatingAgentSession: Promise<string> | null = null
+let startingAgentConversation = false
+let skipSessionLoadId: string | null = null
 
 function openAgentImagePreview(src: string, name = '') {
   if (!src) return
@@ -932,7 +996,10 @@ async function startDictation() {
     workletNode.connect(ctx.destination)
     isDictating.value = true
   } catch (err) {
-    dictationError.value = err instanceof Error ? err.message : '无法访问麦克风'
+    const errorName = err instanceof Error ? err.name : ''
+    dictationError.value = errorName === 'NotAllowedError' || errorName === 'PermissionDeniedError'
+      ? '请允许浏览器使用麦克风后重试'
+      : (err instanceof Error ? err.message : '无法访问麦克风')
   }
 }
 
@@ -1071,17 +1138,26 @@ function openAgentSession(sessionId: string) {
 }
 
 async function handleStartConversation() {
-  // 先本地预插入一个“新任务”占位，保证侧边栏即时可见
-  const newId = generateSessionId()
-  currentSessionId = newId
-  pendingNewSessionId.value = newId
-  upsertLocalAgentSession({
-    id: newId,
-    title: '新任务',
-    lastMessage: ''
-  })
-
-  router.push({ path: '/agent', query: { sessionId: newId } })
+  if (startingAgentConversation) return
+  startingAgentConversation = true
+  errorMessage.value = ''
+  const provisionalId = generateSessionId()
+  currentSessionId = provisionalId
+  pendingNewSessionId.value = provisionalId
+  upsertLocalAgentSession({ id: provisionalId, title: '新任务', lastMessage: '' })
+  try {
+    // 先进入新会话页面，再在后台创建；占位 ID 会被路由监听器识别并跳过历史查询。
+    await router.replace({ path: '/agent', query: { sessionId: provisionalId } })
+    void ensureAgentSession('新任务').catch((error) => {
+      errorMessage.value = error instanceof Error ? error.message : '创建会话失败'
+    })
+  } catch (error) {
+    currentSessionId = null
+    pendingNewSessionId.value = null
+    errorMessage.value = error instanceof Error ? error.message : '打开会话失败'
+  } finally {
+    startingAgentConversation = false
+  }
 }
 
 // 触发附件选择
@@ -1107,6 +1183,7 @@ async function addAgentFile(file: File) {
     setTimeout(() => (warnMessage.value = ''), 3000)
     return
   }
+  if (!currentSessionId && !sessionIdFromRoute.value) await handleStartConversation()
   const sessionId = currentSessionId ?? sessionIdFromRoute.value
   if (!sessionId) {
     warnMessage.value = '请先开始会话再上传附件'
@@ -1123,6 +1200,8 @@ async function addAgentFile(file: File) {
   agentAttachments.value.push(item)
   agentIsUploading.value = true
   try {
+    // confirm 必须使用已创建会话的 ID，不能使用首页生成的本地占位 ID。
+    const confirmedSessionId = await ensureAgentSession(userInput.value.trim() || '新任务')
     const compressed = await compressMediaAttachment(file)
     // 压缩期间用户可能删除了该附件，删除后不再继续上传
     const stillExists = agentAttachments.value.some((a) => a.id === id)
@@ -1132,8 +1211,10 @@ async function addAgentFile(file: File) {
     const uploadSize = typeof fileToUpload.size === 'number' ? fileToUpload.size : 0
     const fileName = compressed.fileName ?? file.name ?? ''
     const fileType = compressed.fileType ?? file.type ?? ''
+    const runId = draftRunId ?? (draftRunId = createRunId())
     const { fileUrl, attachmentId } = await uploadFile(fileToUpload, {
-      conservation_id: String(sessionId),
+      conservation_id: confirmedSessionId,
+      runId,
       fileSize: uploadSize,
       fileName,
       fileType
@@ -1194,22 +1275,93 @@ function isAgentTextLikeFile(fileName: string, fileType: string): boolean {
 
 // 已废弃的基于 stepIndex / reasoningBlocks 的逻辑移除
 
-// Markdown 渲染（历史消息用 marked；当前条流式时用 transformMarkdownForStream 以支持流式解析与光标）
-function getAssistantMessageHtml(msg: Message, index: number): string {
+// 流式与历史消息使用同一套 Markdown 渲染规则。
+function getAssistantMessageHtml(msg: Message): string {
   const text = msg.content || ''
-  const isStreamingLast =
-    msg.role === 'assistant' &&
-    isRunning.value &&
-    index === messages.value.length - 1
-  if (isStreamingLast) {
-    return transformMarkdownForStream(text, { appendCursor: true, allowEmpty: true })
-  }
   if (!text) return ''
-  return marked(text, { breaks: true }) as string
+  return decorateGeneratedDownloads(transformMarkdownForStream(text, { appendCursor: false, allowEmpty: true }))
 }
 
 function renderStepText(content: string): string {
-  return marked(content, { breaks: true }) as string
+  return decorateGeneratedDownloads(transformMarkdownForStream(content))
+}
+
+const POSSIBLE_FILE_URL = /https?:\/\/[^\s<>"')\]]+/g
+function isGeneratedFileUrl(value: string): boolean {
+  try {
+    const url = new URL(value)
+    return url.protocol === 'https:' &&
+      url.hostname.endsWith('.myqcloud.com') &&
+      url.pathname.includes('/generate/')
+  } catch {
+    return false
+  }
+}
+function decorateGeneratedDownloads(html: string): string {
+  const container = document.createElement('div')
+  container.innerHTML = html
+  const makeCard = (url: string): HTMLAnchorElement => {
+    const card = document.createElement('a')
+    let fileName = new URL(url).pathname.split('/').pop() || '下载文件'
+    try { fileName = decodeURIComponent(fileName) } catch { /* 流式 URL 可能尚未传完 */ }
+    card.className = 'agent-download-card'
+    card.href = url
+    card.target = '_blank'
+    card.rel = 'noopener noreferrer'
+    card.download = fileName
+    card.title = fileName
+    const icon = document.createElement('span')
+    icon.className = 'agent-download-icon'
+    icon.innerHTML = '<svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="M8 3.5h10l7 7v17a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2v-22a2 2 0 0 1 2-2Z" fill="currentColor" opacity=".12"/><path d="M18 3.5v6a2 2 0 0 0 2 2h5M8 3.5h10l7 7v17a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2v-22a2 2 0 0 1 2-2Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M11 18h10M11 22h7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>'
+    const info = document.createElement('span')
+    info.className = 'agent-download-info'
+    const label = document.createElement('span')
+    label.className = 'agent-download-name'
+    label.textContent = fileName
+    const meta = document.createElement('span')
+    meta.className = 'agent-download-meta'
+    const extension = fileName.split('.').pop()?.toUpperCase()
+    meta.textContent = extension && extension !== fileName.toUpperCase() ? `${extension} 文件` : '文件'
+    info.append(label, meta)
+    const action = document.createElement('span')
+    action.className = 'agent-download-action'
+    action.innerHTML = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    card.append(icon, info, action)
+    return card
+  }
+  container.querySelectorAll('a[href]').forEach((link) => {
+    const href = link.getAttribute('href') || ''
+    if (isGeneratedFileUrl(href)) link.replaceWith(document.createElement('br'), makeCard(href), document.createElement('br'))
+  })
+  container.querySelectorAll('code').forEach((code) => {
+    if (code.closest('pre')) return
+    const url = code.textContent?.trim() || ''
+    if (isGeneratedFileUrl(url)) code.replaceWith(document.createElement('br'), makeCard(url), document.createElement('br'))
+  })
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT)
+  const nodes: Text[] = []
+  while (walker.nextNode()) {
+    const node = walker.currentNode as Text
+    if (node.parentElement?.closest('a, code, pre')) continue
+    if (node.textContent?.includes('myqcloud.com')) nodes.push(node)
+  }
+  nodes.forEach((node) => {
+    const value = node.textContent || ''
+    const fragment = document.createDocumentFragment()
+    let start = 0
+    for (const match of value.matchAll(POSSIBLE_FILE_URL)) {
+      const url = match[0].replace(/[.,;!?]+$/, '')
+      if (!isGeneratedFileUrl(url)) continue
+      const index = match.index ?? 0
+      if (index > start) fragment.append(document.createTextNode(value.slice(start, index)))
+      fragment.append(document.createElement('br'), makeCard(url), document.createElement('br'))
+      start = index + url.length
+    }
+    if (start === 0) return
+    if (start < value.length) fragment.append(document.createTextNode(value.slice(start)))
+    node.replaceWith(fragment)
+  })
+  return container.innerHTML
 }
 
 // JSON 格式化
@@ -1275,6 +1427,32 @@ async function createSession(message: string, sessionId?: string): Promise<strin
 
   // 返回最终使用的 sessionId（后端可能会回传同一个 Long）
   return String(result.data.sessionId ?? sid)
+}
+
+async function ensureAgentSession(message: string): Promise<string> {
+  if (!currentSessionId) {
+    currentSessionId = generateSessionId()
+    pendingNewSessionId.value = currentSessionId
+  }
+  if (pendingNewSessionId.value !== currentSessionId) return currentSessionId
+  if (!creatingAgentSession) {
+    const provisionalId = currentSessionId
+    creatingAgentSession = (async () => {
+      const confirmedId = await createSession(message, provisionalId)
+      if (currentSessionId === provisionalId) {
+        currentSessionId = confirmedId
+        pendingNewSessionId.value = null
+        upsertLocalAgentSession({ id: confirmedId, title: message, lastMessage: message })
+        if (confirmedId !== provisionalId) {
+          agentSessions.value = agentSessions.value.filter((s) => s.id !== provisionalId)
+          skipSessionLoadId = confirmedId
+          await router.replace({ path: '/agent', query: { sessionId: confirmedId } })
+        }
+      }
+      return confirmedId
+    })().finally(() => { creatingAgentSession = null })
+  }
+  return creatingAgentSession
 }
 
 // 安全地将任意值转为有限数字（无效或缺失时返回 undefined）
@@ -1356,7 +1534,9 @@ function parseStreamContent(data: string, expectedType: 'reasoning' | 'text'): s
 // 发送消息
 async function handleSend() {
   const text = userInput.value.trim()
-  if (!text || isRunning.value) return
+  if (!text || isRunning.value || hasUnconfirmedAgentAttachments.value) return
+  if (!currentSessionId && !sessionIdFromRoute.value) await handleStartConversation()
+  if (!currentSessionId) return
 
   // 发送时若正在语音输入，先停掉，避免占用麦克风与 UI 状态冲突
   if (isDictating.value) {
@@ -1366,7 +1546,17 @@ async function handleSend() {
   }
 
   // 添加用户消息
-  messages.value.push({ role: 'user', content: text })
+  const runId = draftRunId ?? (draftRunId = createRunId())
+  const submittedAttachments = agentAttachments.value
+    .filter((a) => a.status === 'done' && a.attachmentId != null && a.fileUrl)
+    .map((a): AgentAttachmentVO => ({
+      id: String(a.attachmentId),
+      fileName: a.file.name,
+      fileUrl: a.fileUrl!,
+      fileSize: a.file.size,
+      fileType: a.file.type
+    }))
+  messages.value.push({ role: 'user', content: text, runId, attachments: submittedAttachments })
   userInput.value = ''
   await nextTick()
   scheduleAutoResizeMessageInput()
@@ -1387,28 +1577,8 @@ async function handleSend() {
   isRunning.value = true
 
   try {
-    // 如果还没有会话 ID，则本地先生成一个（不会阻塞首条消息发送）
-    if (!currentSessionId) {
-      currentSessionId = generateSessionId()
-      upsertLocalAgentSession({
-        id: currentSessionId,
-        title: text,
-        lastMessage: text,
-        updateTime: Date.now()
-      })
-      await createSession(text, currentSessionId)
-    } else if (pendingNewSessionId.value) {
-      // 从首页「开始智能体」进来的待创建会话：首条消息时创建会话并加入列表
-      const sid = currentSessionId
-      upsertLocalAgentSession({
-        id: sid,
-        title: text,
-        lastMessage: text,
-        updateTime: Date.now()
-      })
-      await createSession(text, sid)
-      pendingNewSessionId.value = null
-    }
+    // 如果还没有会话 ID，则本地先生成一个；创建失败时保留待创建标记供重试
+    currentSessionId = await ensureAgentSession(text)
     // 确认会话已创建，再提交 /run；后端会校验会话所有权
     // POST + SSE 流，请求体为 AgentSendReq，已登录时请求头携带 Authorization
     const url = '/api/agent/run'
@@ -1426,11 +1596,9 @@ async function handleSend() {
 
     const body: Record<string, unknown> = {
       sessionId: currentSessionId,
+      runId,
       token: token,
       message: text,
-      messageId:
-        crypto.randomUUID?.() ??
-        `msg-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
       attachments: attachmentIds
     }
     if (token) body.token = token
@@ -1448,9 +1616,16 @@ async function handleSend() {
       isRunning.value = false
       return
     }
+    // 服务端已接收本轮及附件后，清空输入区附件卡片；失败响应则保留附件供用户处理。
+    const submittedAttachmentIds = new Set(doneAttachments.map((attachment) => attachment.id))
+    agentAttachments.value = agentAttachments.value.filter(
+      (attachment) => !submittedAttachmentIds.has(attachment.id)
+    )
+    if (draftRunId === runId) draftRunId = null
     // 先插入一条当前助手消息，便于流式更新推理和正文（流式渲染）
     messages.value.push({
       role: 'assistant',
+      runId,
       content: '',
       steps: [],
       attachmentLoading: false,
@@ -1513,6 +1688,13 @@ async function handleSend() {
 
     let terminalEventReceived = false
     const dispatch = (event: string, data: string) => {
+      try {
+        const parsed = JSON.parse(data)
+        const eventRunId = parsed?.meta?.runId
+        if (eventRunId != null && String(eventRunId) !== runId) return
+      } catch {
+        // 兼容旧版非 JSON SSE 数据。
+      }
       switch (event) {
         case 'attachment_loading': {
           currentMessage.attachmentLoading = true
@@ -1602,6 +1784,12 @@ async function handleSend() {
             if (target) {
               currentMessage.attachmentLoading = false
               target.result = content
+              const displayResult = payload.displayResult ?? payload.meta?.displayResult
+              if (typeof displayResult === 'string') target.displayResult = displayResult
+              const displayFormat = payload.displayFormat ?? payload.meta?.displayFormat
+              if (typeof displayFormat === 'string') target.displayFormat = displayFormat
+              const language = payload.language ?? payload.meta?.language
+              if (typeof language === 'string') target.language = language
               if (isMcpResult) target.isMcp = true
               if (toolCallId && !target.toolCallId) target.toolCallId = toolCallId
               // 从 tool_result 的 meta 中提取 cost（耗时，毫秒）
@@ -1786,7 +1974,7 @@ function closeEventSource() {
 async function loadMessages(sessionId: string) {
   messagesLoading.value = true
   try {
-    const response = await apiFetch<any[]>(`/api/agent/messages?sessionId=${sessionId}`, {
+    const response = await apiFetch<AgentMessagesVO>(`/api/agent/messages?sessionId=${sessionId}`, {
       credentials: 'include'
     })
 
@@ -1796,8 +1984,9 @@ async function loadMessages(sessionId: string) {
     }
 
     const result = response.json
-    if (result.code === 200 && Array.isArray(result.data)) {
+    if (result.code === 200 && Array.isArray(result.data?.messages)) {
       const history: Message[] = []
+      const attachmentsByRunId: Record<string, AgentAttachmentVO[]> = result.data.attachmentsByRunId ?? {}
 
       const parsePayload = (payload: unknown): AgentMessagePayload => {
         if (!payload) return {}
@@ -1814,6 +2003,7 @@ async function loadMessages(sessionId: string) {
 
       // 当前正在还原的一轮助手回复
       let currentAssistant: Message | null = null
+      let currentRunId: string | null = null
       let currentSteps: MessageStep[] = []
       let currentStepForHistory: MessageStep | null = null
 
@@ -1849,16 +2039,24 @@ async function loadMessages(sessionId: string) {
         currentStepForHistory = null
       }
 
-      for (const raw of result.data as any[]) {
+      for (const raw of result.data.messages) {
         const type: string = raw.type
+        const rawRunId = raw.runId == null ? null : String(raw.runId)
         const payload: AgentMessagePayload = parsePayload(raw.payload)
+
+        // runId 明确变化时收尾上一轮，确保一轮的 assistant/tool 数据不跨轮合并。
+        if (rawRunId && currentRunId && rawRunId !== currentRunId) finishCurrentAssistant()
+        if (rawRunId) currentRunId = rawRunId
 
         if (type === 'user') {
           // 一轮助手结束，先收尾
           finishCurrentAssistant()
           history.push({
+            id: raw.id == null ? undefined : String(raw.id),
+            runId: rawRunId,
             role: 'user',
             content: payload.content || '',
+            attachments: rawRunId ? (attachmentsByRunId[rawRunId] ?? []) : [],
           })
           continue
         }
@@ -1870,6 +2068,8 @@ async function loadMessages(sessionId: string) {
           // 每遇到一条 assistant，都开启一个新的 step
           if (!currentAssistant) {
             currentAssistant = {
+              id: raw.id == null ? undefined : String(raw.id),
+              runId: rawRunId,
               role: 'assistant',
               content: '',
             }
@@ -1935,6 +2135,12 @@ async function loadMessages(sessionId: string) {
 
           if (target) {
             target.result = payload.toolResult ?? ''
+            const displayResult = payload.displayResult ?? payload.meta?.displayResult
+            if (typeof displayResult === 'string') target.displayResult = displayResult
+            const displayFormat = payload.displayFormat ?? payload.meta?.displayFormat
+            if (typeof displayFormat === 'string') target.displayFormat = displayFormat
+            const language = payload.language ?? payload.meta?.language
+            if (typeof language === 'string') target.language = language
             if (isMcpResult) target.isMcp = true
             const toolCost = toFiniteNumber(payload.cost ?? (raw as any).cost)
             if (toolCost != null) target.cost = toolCost
@@ -1961,11 +2167,17 @@ watch(
   sessionIdFromRoute,
   (newId) => {
     currentSessionId = newId
+    // 首页进入的新会话先使用本地占位 ID；后端创建完成前不能查询历史消息。
+    const isPendingSession = !!newId && newId === pendingNewSessionId.value
     // 切换到其他会话时清除「待创建」标记，避免误走首条消息创建逻辑
-    if (newId && newId !== pendingNewSessionId.value) {
+    if (newId && !isPendingSession) {
       pendingNewSessionId.value = null
     }
-    if (newId) {
+    if (newId && newId === skipSessionLoadId) {
+      skipSessionLoadId = null
+    } else if (isPendingSession) {
+      messages.value = []
+    } else if (newId) {
       loadMessages(newId)
     } else {
       messages.value = []
@@ -1987,6 +2199,56 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
+/* 首页与会话共用安静、宽松的输入界面。 */
+.agent-container .agent-chat { background: #fafafa; }
+.agent-container .agent-chat-home { justify-content: center; padding-bottom: 14vh; }
+.agent-container .input-container { border-top: 0; background: transparent; padding: 18px 28px 26px; }
+.agent-container .input-box-container {
+  grid-template-columns: 32px minmax(0, 1fr) auto;
+  grid-template-areas: "add primary trailing";
+  align-items: center;
+  width: 100%; max-width: 820px; margin: 0 auto;
+  min-height: 58px; padding: 8px 10px 8px 14px;
+  border: 1px solid #e6e7e9; border-radius: 30px;
+  background: #fff; box-shadow: 0 4px 20px rgba(0, 0, 0, .035);
+}
+.agent-container .input-box-container:focus-within { border-color: #cecece; box-shadow: 0 3px 20px rgba(0, 0, 0, .06); }
+.composer-add { grid-area: add; align-self: center; display: grid; place-items: center; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: #444; font-size: 25px; line-height: 1; cursor: pointer; }
+.composer-add:hover { background: #f2f2f2; }
+.composer-add:focus-visible { outline: 2px solid #2c66ce; outline-offset: 2px; }
+.composer-add:disabled { opacity: .4; cursor: default; }
+.agent-container .legacy-attach-button { display: none; }
+.agent-container .input-box-container .message-input { width: 100%; min-width: 0; min-height: 26px; font-size: 15px; line-height: 24px; padding: 1px 4px; color: #222; }
+.agent-container .message-input::placeholder { color: #96999e; font-size: 15px; }
+.agent-container .input-trailing { align-self: center; gap: 8px; }
+.agent-container .input-trailing .input-action-btn { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; padding: 0; border-radius: 50%; }
+.agent-container .input-trailing .legacy-attach-button { display: none; }
+.agent-container .send-button { display: grid; place-items: center; width: 38px; height: 38px; min-width: 38px; padding: 0; border-radius: 50%; border: 0; color: white; background: #2c66ce; box-shadow: none; }
+.agent-container .send-button:disabled { background: #e9e9e9; color: #9b9b9b; opacity: 1; }
+.agent-container .messages-container { background: transparent; padding: 28px max(24px, calc((100% - 960px) / 2)); }
+.agent-container .message-group { max-width: 100%; }
+.agent-message-attachments { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin: 0 0 8px; }
+.agent-message-attachment { display: inline-flex; align-items: center; gap: 11px; width: 240px; max-width: 100%; height: 64px; max-height: 64px; padding: 8px 13px; box-sizing: border-box; border: 1px solid #e1e4e8; border-radius: 12px; background: linear-gradient(145deg, #fff, #f6f8fa); color: #4b5563; font: inherit; font-size: 13px; text-decoration: none; cursor: pointer; box-shadow: 0 2px 7px rgba(28, 41, 61, .05); }
+.agent-message-attachment:hover { border-color: #c8d3e3; }
+.agent-message-attachment span:last-child { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.agent-message-attachment-image { width: 38px; height: 38px; border-radius: 7px; object-fit: cover; }
+.agent-message-file-icon { display: grid; place-items: center; width: 38px; height: 38px; flex: none; border-radius: 9px; background: #eaf0f9; color: #5d7dab; }
+.agent-message-file-icon svg { width: 25px; height: 25px; }
+:global(.dark) .agent-message-attachment { border-color: #3b414b; background: linear-gradient(145deg, #292e36, #22272f); color: #cbd5e1; }
+:global(.dark) .agent-message-file-icon { background: #344258; color: #a4bee5; }
+.agent-container .message-bubble.user { background: #eeeeef; color: #222; border: 0; border-radius: 24px; padding: 12px 20px; box-shadow: none; }
+.agent-container .attachments-list { max-width: 820px; margin: 0 auto 12px; }
+:global(.dark) .agent-container .agent-chat { background: #171717; }
+:global(.dark) .agent-container .input-container { background: transparent; }
+:global(.dark) .agent-container .input-box-container { background: #242424; border-color: #393939; }
+:global(.dark) .agent-container .message-input, :global(.dark) .composer-add { color: #ededed; }
+:global(.dark) .agent-container .message-bubble.user { background: #303030; color: #eee; }
+@media (max-width: 640px) {
+  .agent-container .input-container { padding: 12px 12px 18px; }
+  .agent-container .input-box-container { min-height: 60px; padding: 6px 8px 6px 12px; gap: 4px; }
+  .agent-container .input-box-container .message-input, .agent-container .message-input::placeholder { font-size: 15px; }
+  .agent-container .send-button { width: 40px; height: 40px; min-width: 40px; }
+}
 .agent-container {
   --agent-accent: #5f7ea8;
   --agent-accent-soft: #e7eef8;
@@ -2000,6 +2262,23 @@ onBeforeUnmount(() => {
   flex-direction: column;
   height: 100vh;
   background: #f7f8fa;
+  user-select: none;
+}
+
+/* 聊天内容和输入仍可复制，界面控件不参与拖选。 */
+.agent-container .message-content,
+.agent-container .message-bubble.user,
+.agent-container .agent-run-details,
+.agent-container .agent-message-details,
+.agent-container :deep(.detail-content),
+.agent-container input,
+.agent-container textarea {
+  user-select: text;
+}
+.agent-container button,
+.agent-container .agent-message-toolbar,
+.agent-container .agent-message-attachments {
+  user-select: none;
 }
 
 .chat-header {
@@ -2130,7 +2409,7 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: var(--spacing-lg);
+  gap: 12px;
 }
 
 /* 生成文件卡片区块（独立于 ToolCallCard） */
@@ -2161,17 +2440,39 @@ onBeforeUnmount(() => {
 
 /* 正文 Markdown 样式（Agent 助手消息） */
 .message-content.assistant-body {
-  width: min(98%, 1180px);
+  width: min(100%, 860px);
+  max-width: 100%;
   padding: 0;
   border-radius: 0;
   border: none;
   background: transparent;
   box-shadow: none;
   box-sizing: border-box;
-  font-size: 17px;
-  line-height: 1.85;
+  font-size: 15px;
+  line-height: 1.75;
   color: var(--agent-text);
+  overflow-x: auto;
 }
+
+.message-content.assistant-body :deep(h1),
+.message-content.assistant-body :deep(h2),
+.message-content.assistant-body :deep(h3),
+.message-content.assistant-body :deep(h4) {
+  margin: 1.25em 0 0.5em;
+  color: var(--agent-text);
+  font-weight: 600;
+  line-height: 1.4;
+}
+.message-content.assistant-body :deep(h1) { font-size: 1.4em; }
+.message-content.assistant-body :deep(h2) { font-size: 1.2em; }
+.message-content.assistant-body :deep(h3) { font-size: 1.08em; }
+.message-content.assistant-body :deep(h4) { font-size: 1em; }
+.message-content.assistant-body :deep(h5),
+.message-content.assistant-body :deep(h6) { margin: 1.1em 0 0.45em; font-size: 1em; line-height: 1.45; }
+.message-content.assistant-body :deep(h1:first-child),
+.message-content.assistant-body :deep(h2:first-child),
+.message-content.assistant-body :deep(h3:first-child),
+.message-content.assistant-body :deep(h4:first-child) { margin-top: 0; }
 
 :global(.dark) .messages-container {
   background: #020617;
@@ -2201,7 +2502,7 @@ onBeforeUnmount(() => {
 }
 
 .message-content.assistant-body :deep(p) {
-  margin: 0.75em 0;
+  margin: 0.65em 0;
 }
 
 .message-content.assistant-body :deep(p:first-child) {
@@ -2214,23 +2515,63 @@ onBeforeUnmount(() => {
 
 .message-content.assistant-body :deep(ul),
 .message-content.assistant-body :deep(ol) {
-  margin: 0.75em 0;
-  padding-left: 1.5em;
+  margin: 0.65em 0;
+  padding-left: 1.4em;
 }
 
 .message-content.assistant-body :deep(li) {
   margin: 0.25em 0;
   font-size: 1em;
 }
+.message-content.assistant-body :deep(li > p) { margin: 0.3em 0; }
+.message-content.assistant-body :deep(li > ul),
+.message-content.assistant-body :deep(li > ol) { margin: 0.35em 0; }
+.message-content.assistant-body :deep(hr) { height: 1px; margin: 1.5em 0; border: 0; background: #e1e6ec; }
+:global(.dark) .message-content.assistant-body :deep(hr) { background: #3b4655; }
 
 .message-content.assistant-body :deep(a) {
   color: #476a99;
   text-decoration: underline;
+  overflow-wrap: anywhere;
 }
+.message-content.assistant-body :deep(a:focus-visible) { outline: 2px solid #7e9ac2; outline-offset: 3px; border-radius: 3px; }
 
 .message-content.assistant-body :deep(a:hover) {
   color: #345277;
 }
+
+.message-content.assistant-body :deep(.agent-download-card) {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: min(100%, 348px);
+  min-height: 68px;
+  margin: 8px auto;
+  padding: 10px 13px;
+  box-sizing: border-box;
+  border: 1px solid #e0e5ec;
+  border-radius: 12px;
+  background: #fafbfd;
+  color: #334155;
+  text-decoration: none;
+  user-select: none;
+  box-shadow: 0 2px 8px rgba(27, 43, 66, .045);
+}
+.message-content.assistant-body :deep(.agent-download-card:hover) { border-color: #aabed9; background: #f5f8fc; box-shadow: 0 4px 14px rgba(27, 43, 66, .08); }
+.message-content.assistant-body :deep(.agent-download-icon) { display: grid; place-items: center; width: 44px; height: 44px; flex: none; border-radius: 10px; background: #eaf0f9; color: #5d7dab; }
+.message-content.assistant-body :deep(.agent-download-icon svg) { width: 27px; height: 27px; }
+.message-content.assistant-body :deep(.agent-download-info) { display: flex; flex: 1; flex-direction: column; min-width: 0; gap: 2px; }
+.message-content.assistant-body :deep(.agent-download-name) { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 13px; font-weight: 600; line-height: 1.4; }
+.message-content.assistant-body :deep(.agent-download-meta) { color: #8993a1; font-size: 11px; line-height: 1.3; }
+.message-content.assistant-body :deep(.agent-download-action) { display: grid; place-items: center; width: 29px; height: 29px; flex: none; border-radius: 7px; color: #71839b; }
+.message-content.assistant-body :deep(.agent-download-action svg) { width: 18px; height: 18px; }
+.message-content.assistant-body :deep(.agent-download-card:hover .agent-download-action) { background: #e5edf8; color: #406a9e; }
+:global(.dark) .message-content.assistant-body :deep(.agent-download-card) { border-color: #3a485b; background: #232d3b; color: #d6e3f3; }
+:global(.dark) .message-content.assistant-body :deep(.agent-download-icon) { background: #344762; color: #a9c9f5; }
+:global(.dark) .message-content.assistant-body :deep(.agent-download-meta) { color: #97a5b6; }
+:global(.dark) .message-content.assistant-body :deep(.agent-download-action) { color: #a9bdd5; }
+:global(.dark) .message-content.assistant-body :deep(.agent-download-card:hover) { background: #293648; border-color: #607897; }
+:global(.dark) .message-content.assistant-body :deep(.agent-download-card:hover .agent-download-action) { background: #3a4b63; color: #d5e5fa; }
 
 :global(.dark) .message-content.assistant-body :deep(a) {
   color: #93c5fd;
@@ -2239,6 +2580,8 @@ onBeforeUnmount(() => {
 :global(.dark) .message-content.assistant-body :deep(a:hover) {
   color: #bfdbfe;
 }
+:global(.dark) .message-content.assistant-body :deep(a.agent-download-card),
+:global(.dark) .message-content.assistant-body :deep(a.agent-download-card:hover) { color: #d6e3f3; }
 
 .message-content.assistant-body :deep(strong) {
   font-weight: 600;
@@ -2271,6 +2614,7 @@ onBeforeUnmount(() => {
   overflow-x: auto;
   font-size: 0.95em;
   line-height: 1.5;
+  white-space: pre;
 }
 
 :global(.dark) .message-content.assistant-body :deep(pre) {
@@ -2282,6 +2626,7 @@ onBeforeUnmount(() => {
   background: none;
   padding: 0;
   font-size: inherit;
+  white-space: inherit;
 }
 
 .message-content.assistant-body :deep(blockquote) {
@@ -2299,14 +2644,25 @@ onBeforeUnmount(() => {
 .message-content.assistant-body :deep(table) {
   border-collapse: collapse;
   width: 100%;
-  margin: 1em 0;
+  margin: 1.1em 0 1.25em;
+  font-size: 0.94em;
+  line-height: 1.6;
+  min-width: 420px;
 }
 
 .message-content.assistant-body :deep(th),
 .message-content.assistant-body :deep(td) {
-  border: 1px solid #dbe3ee;
-  padding: 0.5em 0.75em;
+  border: 0;
+  border-bottom: 1px solid #e1e6ec;
+  padding: 0.65em 0.8em;
   text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+.message-content.assistant-body :deep(th:first-child),
+.message-content.assistant-body :deep(td:first-child) {
+  width: 22%;
+  min-width: 120px;
 }
 
 :global(.dark) .message-content.assistant-body :deep(th),
@@ -2316,7 +2672,7 @@ onBeforeUnmount(() => {
 }
 
 .message-content.assistant-body :deep(th) {
-  background: #f4f7fb;
+  background: #f4f6f8;
   font-weight: 600;
 }
 
@@ -2331,6 +2687,7 @@ onBeforeUnmount(() => {
   max-height: 320px;
   border-radius: var(--radius-md);
 }
+.message-content.assistant-body :deep(input[type='checkbox']) { margin-right: 0.4em; accent-color: #5d7dab; }
 
 /* 附件读取中的波浪提示 */
 .attachment-loading {
@@ -2348,7 +2705,6 @@ onBeforeUnmount(() => {
 }
 
 :global(.dark) .attachment-loading-text,
-:global(.dark) .agent-message-footer,
 :global(.dark) .messages-loading-text,
 :global(.dark) .attach-card-type {
   color: #cbd5e1;
@@ -2395,30 +2751,22 @@ onBeforeUnmount(() => {
   46%, 100% { opacity: 0.25; }
 }
 
-/* 消息 footer：展示 usage 统计信息（Token / 耗时） */
-.agent-message-footer {
-  margin-top: 2px;
-  padding: 0 6px;
-  font-size: 12px;
-  color: var(--agent-text-muted);
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 8px;
-}
-
-.message-content.assistant-body :deep(.sse_cursor) {
-  display: inline-block;
-  width: 2px;
-  height: 1em;
-  margin-left: 2px;
-  vertical-align: text-bottom;
-  background: var(--primary);
-  animation: sse-cursor-blink 1s step-end infinite;
-}
-
-@keyframes sse-cursor-blink {
-  50% { opacity: 0; }
-}
+.agent-message-actions { position: relative; margin-top: 5px; }
+.agent-message-toolbar { display: inline-flex; align-items: center; gap: 2px; min-height: 32px; padding: 2px 4px; border: 1px solid #e7e9ed; border-radius: 9px; background: #f8f9fa; }
+.agent-message-action { display: grid; place-items: center; width: 29px; height: 29px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: #7f8791; cursor: pointer; }
+.agent-message-action:hover { background: #e9edf2; color: #3d4652; }
+.agent-message-action:disabled { opacity: .4; cursor: default; }
+.agent-message-action:focus-visible { outline: 2px solid #7e9ac2; outline-offset: 2px; }
+.agent-message-action svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.agent-message-action svg circle { fill: currentColor; stroke: none; }
+.agent-message-details { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 20; display: grid; gap: 8px; width: 190px; max-width: calc(100vw - 48px); padding: 12px 14px; border: 1px solid #e7e9ed; border-radius: 10px; background: #fff; box-shadow: 0 8px 24px rgba(28, 41, 61, .08); color: #68717e; font-size: 12px; }
+.agent-message-details div { display: flex; justify-content: space-between; gap: 16px; }
+.agent-message-details strong { color: #343d49; font-weight: 500; }
+:global(.dark) .agent-message-toolbar { border-color: #3b414b; background: #252a31; }
+:global(.dark) .agent-message-action { color: #a8b2bf; }
+:global(.dark) .agent-message-action:hover { background: #343c47; color: #ecf1f7; }
+:global(.dark) .agent-message-details { border-color: #3b414b; background: #252a31; color: #a8b2bf; }
+:global(.dark) .agent-message-details strong { color: #e2e8f0; }
 
 /* Thinking 块 */
 .thinking-block {
@@ -2857,12 +3205,25 @@ onBeforeUnmount(() => {
   color: var(--agent-text-muted);
 }
 
-.agent-run { width: min(98%, 1100px); max-width: 100%; margin-bottom: 10px; }
+.agent-run { width: min(100%, 860px); max-width: 100%; margin-bottom: 2px; }
 .agent-run-toggle { display: inline-flex; align-items: center; gap: 9px; min-height: 32px; padding: 3px 6px; border: 0; border-radius: 6px; background: transparent; color: #7c8592; font: inherit; font-size: 13px; cursor: pointer; }
 .agent-run-toggle:hover { background: rgba(105, 125, 150, .07); color: #424b58; }
 .agent-run-toggle:focus-visible { outline: 2px solid #7e9ac2; outline-offset: 2px; }
 .agent-run-title { color: #535d6b; font-weight: 500; }
 .agent-run-duration { color: #929aa5; font-size: 12px; }
+.agent-run-toggle.is-running .agent-run-title,
+.agent-run-toggle.is-running .agent-run-duration {
+  color: transparent;
+  background: linear-gradient(100deg, #737f8e 28%, #dce4ed 50%, #737f8e 72%);
+  background-size: 220% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  animation: agent-run-sheen 2.4s linear infinite;
+}
+@keyframes agent-run-sheen {
+  from { background-position: 200% 0; }
+  to { background-position: -20% 0; }
+}
 .agent-run-chevron { width: 15px; height: 15px; color: #9aa2ad; transition: transform .18s ease; }
 .agent-run-chevron.expanded { transform: rotate(180deg); }
 .agent-run-details { margin-top: 4px; padding: 7px 0 0 9px; border-top: 1px solid #e8eaee; }
@@ -2872,6 +3233,18 @@ onBeforeUnmount(() => {
 :global(.dark) .agent-run-toggle { color: #a6afba; }
 :global(.dark) .agent-run-title { color: #c0c8d3; }
 :global(.dark) .agent-run-duration { color: #8994a3; }
+:global(.dark) .agent-run-toggle.is-running .agent-run-title,
+:global(.dark) .agent-run-toggle.is-running .agent-run-duration {
+  background-image: linear-gradient(100deg, #9caabd 28%, #f3f7fc 50%, #9caabd 72%);
+}
+@media (prefers-reduced-motion: reduce) {
+  .agent-run-toggle.is-running .agent-run-title { color: #737f8e; }
+  .agent-run-toggle.is-running .agent-run-duration { color: #929aa5; }
+  :global(.dark) .agent-run-toggle.is-running .agent-run-title { color: #c0c8d3; }
+  :global(.dark) .agent-run-toggle.is-running .agent-run-duration { color: #8994a3; }
+  .agent-run-toggle.is-running .agent-run-title,
+  .agent-run-toggle.is-running .agent-run-duration { background: none; animation: none; }
+}
 :global(.dark) .agent-run-details { border-top-color: #354052; }
 
 .send-button:disabled {
@@ -3012,7 +3385,7 @@ onBeforeUnmount(() => {
 /* 实时语音转文字 / 错误气泡（参考 Chat.vue，Teleport 到 body 仍可应用 scoped 样式） */
 .dictation-bubble {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   min-height: 44px;
   padding: 10px 12px;
   border-radius: 10px;
@@ -3037,7 +3410,8 @@ onBeforeUnmount(() => {
   left: 50%;
   transform: translateX(-50%);
   bottom: 100px;
-  width: min(90vw, 560px);
+  width: min(88vw, 380px);
+  box-sizing: border-box;
   z-index: 9999;
 }
 
@@ -3054,7 +3428,7 @@ onBeforeUnmount(() => {
 
 .dictation-bubble-actions {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   gap: 6px;
   margin-left: 12px;
   flex-shrink: 0;

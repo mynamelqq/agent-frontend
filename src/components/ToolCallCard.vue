@@ -10,8 +10,8 @@
       <svg class="runtime-tool-chevron" width="15" height="15" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>
     </button>
     <div v-if="expanded" class="tool-details">
-      <div class="detail-section"><div class="detail-heading">{{ argsLabel }}</div><pre class="detail-content">{{ formattedArgs || '—' }}</pre></div>
-      <div class="detail-section"><div class="detail-heading">{{ resultLabel }}</div><pre class="detail-content" :class="{ waiting: !hasResult }">{{ hasResult ? formattedResult : waitingLabel }}</pre></div>
+      <pre v-if="isPythonCode" class="detail-content code-content"><code class="hljs language-python" v-html="highlightedResult"></code></pre>
+      <pre v-else class="detail-content" :class="{ waiting: !hasResult }">{{ hasResult ? visibleResult : waitingLabel }}</pre>
       <div class="detail-actions"><span>{{ [exitCodeLabel, costLabel].filter(Boolean).join(' · ') }}</span><button type="button" :disabled="!hasResult" @click="copyResult">{{ copyBtnText }}</button></div>
     </div>
   </div>
@@ -19,6 +19,9 @@
 
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import hljs from 'highlight.js/lib/core'
+import python from 'highlight.js/lib/languages/python'
+hljs.registerLanguage('python', python)
 type LangMode = 'zh' | 'en' | 'bilingual'
 const props = withDefaults(defineProps<{
   toolName: string
@@ -26,6 +29,9 @@ const props = withDefaults(defineProps<{
   langMode?: LangMode
   args?: string
   result?: string | null
+  displayResult?: string
+  displayFormat?: string
+  language?: string
   cost?: number
   isMcp?: boolean
 }>(), { args: '', result: null, langMode: 'zh', isMcp: false })
@@ -33,10 +39,8 @@ const expanded = ref(false)
 const copyBtnText = ref('')
 const isEn = computed(() => props.langMode === 'en')
 const isZh = computed(() => props.langMode === 'zh')
-const hasResult = computed(() => props.result != null)
+const hasResult = computed(() => props.result != null || props.displayResult != null)
 const resolvedToolName = computed(() => props.displayName || props.toolName)
-const argsLabel = computed(() => isEn.value ? 'Input' : isZh.value ? '输入' : '输入 / Input')
-const resultLabel = computed(() => isEn.value ? 'Output' : isZh.value ? '输出' : '输出 / Output')
 const waitingLabel = computed(() => isEn.value ? 'Waiting for result…' : '等待工具返回结果…')
 function parseJson(value: string | null | undefined): unknown {
   if (!value) return null
@@ -56,13 +60,16 @@ function formatValue(value: string | null | undefined): string {
   if (parsed === null) return value
   return typeof parsed === 'string' ? parsed : JSON.stringify(parsed, null, 2)
 }
-const formattedArgs = computed(() => formatValue(props.args))
 const formattedResult = computed(() => formatValue(props.result))
+const visibleResult = computed(() => props.displayResult?.trim() ? props.displayResult : formattedResult.value)
+const isPythonCode = computed(() => hasResult.value && props.displayFormat === 'code' && props.language?.toLowerCase() === 'python')
+const highlightedResult = computed(() => hljs.highlight(visibleResult.value, { language: 'python' }).value)
 function shortText(value: unknown, max = 90): string {
   const text = String(value ?? '').replace(/\s+/g, ' ').trim()
   return text.length > max ? `${text.slice(0, max - 1)}…` : text
 }
 const summaryText = computed(() => {
+  if (hasResult.value) return shortText(visibleResult.value)
   const args = parseJson(props.args)
   if (args && typeof args === 'object' && !Array.isArray(args)) {
     const obj = args as Record<string, unknown>
@@ -72,13 +79,13 @@ const summaryText = computed(() => {
     const first = Object.values(obj).find(value => typeof value === 'string' && value.trim())
     if (first) return shortText(first)
   }
-  return props.args ? shortText(formatValue(props.args)) : hasResult.value ? shortText(formattedResult.value) : ''
+  return props.args ? shortText(formatValue(props.args)) : ''
 })
 watch(() => props.langMode, () => { copyBtnText.value = isEn.value ? 'Copy output' : isZh.value ? '复制输出' : '复制输出 / Copy' }, { immediate: true })
 async function copyResult() {
   if (!hasResult.value) return
   try {
-    await navigator.clipboard.writeText(formattedResult.value)
+    await navigator.clipboard.writeText(visibleResult.value)
     copyBtnText.value = isEn.value ? 'Copied' : '已复制'
     window.setTimeout(() => { copyBtnText.value = isEn.value ? 'Copy output' : '复制输出' }, 1500)
   } catch { copyBtnText.value = isEn.value ? 'Copy failed' : '复制失败' }
@@ -95,10 +102,12 @@ async function copyResult() {
 .runtime-tool-summary { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: #8a9099; }
 .runtime-tool-chevron { width: 15px; height: 15px; flex: none; margin-left: auto; color: #9ca2aa; transition: transform .18s ease; }
 .runtime-tool.expanded .runtime-tool-chevron { transform: rotate(180deg); }
-.tool-details { margin: 4px 0 10px 25px; padding: 8px 12px; border-left: 1px solid #e2e5e9; }
+.tool-details { max-height: min(270px, 43vh); margin: 4px 0 10px 25px; padding: 8px 12px; overflow-y: auto; border-left: 1px solid #e2e5e9; }
 .detail-section + .detail-section { margin-top: 12px; }
 .detail-heading { margin-bottom: 5px; color: #888f99; font-size: 11px; }
-.detail-content { max-height: 240px; margin: 0; padding: 9px 11px; overflow: auto; border-radius: 6px; background: #f6f7f8; color: #4b5563; font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.detail-content { margin: 0; padding: 9px 11px; overflow-x: auto; border-radius: 6px; background: #f6f7f8; color: #4b5563; font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.detail-content.code-content { padding: 5px 0; background: transparent; }
+.code-content code.hljs { padding: 0; background: transparent; color: inherit; }
 .detail-content.waiting { color: #9299a2; }
 .detail-actions { display: flex; justify-content: space-between; align-items: center; gap: 12px; min-height: 28px; color: #969da6; font-size: 11px; }
 .detail-actions button { margin-left: auto; padding: 3px 0; border: 0; background: transparent; color: #65748a; font: inherit; cursor: pointer; }
@@ -108,4 +117,5 @@ async function copyResult() {
 :global(.dark) .runtime-tool-summary, :global(.dark) .runtime-tool-icon { color: #8994a3; }
 :global(.dark) .tool-details { border-left-color: #364152; }
 :global(.dark) .detail-content { background: #1c2634; color: #cbd5e1; }
+:global(.dark) .detail-content.code-content { background: transparent; }
 </style>

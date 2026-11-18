@@ -10,6 +10,7 @@ export interface UploadResult {
 export interface UploadConfirmOptions {
   conservation_id: string
   chat_id?: string
+  runId?: string
   /** 若调用方在选文件时已读取，可传入以规避异步后 file.size 为 0 的情况 */
   fileSize?: number
   fileName?: string
@@ -65,6 +66,7 @@ export async function uploadFile(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       chat_id: options.chat_id ?? '',
+      ...(options.runId ? { runId: options.runId } : {}),
       conservation_id: options.conservation_id,
       file_name: fileName,
       file_url: fileUrl,
